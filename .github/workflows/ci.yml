@@ -53,6 +53,13 @@ jobs:
             echo "OK: $p refused egress as expected"
           done
 
+      - name: Notebook must match its generator
+        # The .ipynb is generated, not hand-edited. If this fails, someone edited
+        # the notebook directly and the change would be lost on next regeneration.
+        run: |
+          python notebooks/_build_notebook.py
+          git diff --exit-code -- notebooks/colab_runner.ipynb
+
       - name: Committed corpora must match what the committed seed regenerates
         # If this fails, someone hand-edited data or changed a generator without
         # regenerating -- either way the benchmark is no longer reproducible.

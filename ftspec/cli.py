@@ -284,8 +284,9 @@ def tco(
     peak_rps: float = typer.Option(5.0),
     training_cost: float = typer.Option(15.0),
     amortise_months: int = typer.Option(12),
-    prompt_tokens_api: int = typer.Option(820),
-    output_tokens: int = typer.Option(190),
+    prompt_tokens_api: int = typer.Option(
+        1437, help="Prompt tokens a hosted baseline pays per call (schema + policy + document)."),
+    output_tokens: int = typer.Option(162, help="Mean output tokens per call."),
 ):
     """Break-even analysis: at what volume does self-hosting actually win?"""
     from ftspec.evaluation import tco as tco_mod

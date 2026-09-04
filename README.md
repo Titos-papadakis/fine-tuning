@@ -1,5 +1,9 @@
 # Enterprise SLM Specialization Framework
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Titos-papadakis/fine-tuning/blob/main/notebooks/colab_runner.ipynb)
+[![CI](https://github.com/Titos-papadakis/fine-tuning/actions/workflows/ci.yml/badge.svg)](https://github.com/Titos-papadakis/fine-tuning/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **Modular, privacy-preserving 8B model adapters for regulated and high-volume workflows.**
 
 A domain-agnostic engine for turning an open-weight small language model into a specialist
@@ -35,7 +39,7 @@ are fixed by better prompting:
 
 | Cost | Why prompting cannot fix it |
 |---|---|
-| **The prompt tax** | Your schema and your business policy must be re-sent on **every single call, forever**. On this repo's fintech profile that is ~800 tokens per call — 80M tokens per 100k calls, paid indefinitely. |
+| **The prompt tax** | Your schema and your business policy must be re-sent on **every single call, forever**. Measured on this repo's fintech profile: ~1,670 tokens per call — 167M tokens per 100k calls, paid indefinitely. |
 | **Policy blindness** | `risk_band`, `priority`, `acuity` are set by *your* internal rubric. A general model cannot infer your thresholds. It can be told them, at the cost above, or it guesses — and guesses wrong systematically, not randomly. |
 | **Egress** | For PCI-DSS or HIPAA data, sending records to a third-party API is not an expensive option. It is frequently not a lawful one. |
 
@@ -43,8 +47,9 @@ are fixed by better prompting:
 
 Three things, stated precisely — and one thing it does not:
 
-1. **Prompt compression.** The schema and the rubric live in the weights. The system prompt
-   collapses from ~800 tokens to ~20. That saving is permanent and compounds with volume.
+1. **Prompt compression.** The schema and the rubric live in the weights. Measured on the
+   `saas_support` corpus, the system prompt collapses from **1,253 tokens to 12** — a 7.3×
+   cut in total prefill. Permanent, and it compounds with volume.
 2. **Encoded judgement.** 200 examples teach a policy you cannot fit, or would rather not
    ship, in every prompt. This is the part no prompting technique replicates.
 3. **Sovereignty.** The model runs inside your boundary. For regulated verticals this is not
@@ -185,15 +190,95 @@ The `base-constrained` row exists to make the honest point in public: it reaches
 adherence with no training whatsoever, and its *accuracy* is what tells you whether
 specialization was worth it.
 
-> **No benchmark numbers are committed to this repository.**
-> The matrix is produced by running `ftspec evaluate` on your hardware, against your eval
-> split, and is written to `outputs/<profile>/reports/benchmark_report.md`. Pre-baked numbers
-> in a vendor README are marketing; these are reproducible or they are nothing. Significance
-> testing is included precisely so a 4-point gap is not reported as a win.
+---
+
+## Projected economics
+
+> **These are modeled, not measured.** Token counts are real — measured from the committed
+> `saas_support` eval corpus. Throughput and TTFT are engineering estimates for an 8B model in
+> 4-bit on a T4, and they are the numbers you should be most sceptical of, because they move
+> with batch size more than anything else. The arithmetic is printed below so you can check it
+> rather than trust it. **[Run the notebook](https://colab.research.google.com/github/Titos-papadakis/fine-tuning/blob/main/notebooks/colab_runner.ipynb)
+> and this section gets replaced with numbers from your own hardware.**
+
+Measured prompt sizes (`saas_support`, mean over the 150-document held-out split):
+
+| | System prompt | + document | Output |
+|---|---:|---:|---:|
+| Specialized 8B | **12 tok** | 196 tok | 162 tok |
+| Prompted baseline (schema + policy) | **1,253 tok** | 1,437 tok | 162 tok |
+
+That is a **7.3× prefill reduction on every call**, and it is the mechanism behind both the
+latency and the cost figures below.
+
+### Cost per 1,000 requests
+
+| System | Input | Output | Cost / 1k | vs GPT-4o |
+|---|---:|---:|---:|---:|
+| GPT-4o | 1,437 tok @ $2.50/1M | 162 tok @ $10/1M | **$5.21** | — |
+| GPT-4o-mini | 1,437 tok @ $0.15/1M | 162 tok @ $0.60/1M | **$0.31** | −94% |
+| Self-hosted T4, single stream | — | ~18 tok/s | **~$0.90** | **−83%** |
+| Self-hosted T4, batched (~8 concurrent) | — | ~110 tok/s aggregate | **~$0.17** | **−97%** |
+
+<details>
+<summary>The arithmetic</summary>
+
+```
+GPT-4o        (1437/1e6 × $2.50) + (162/1e6 × $10.00)  = $0.00521/req  → $5.21/1k
+GPT-4o-mini   (1437/1e6 × $0.15) + (162/1e6 × $0.60)   = $0.00031/req  → $0.31/1k
+
+Self-hosted   sec/req = TTFT + output_tokens / decode_rate
+              single:  0.25s + 162/18   =  9.25 s/req → 389 req/hr
+              batched: 0.25s + 162/110  =  1.72 s/req → 2,093 req/hr
+              cost/req = $0.35/hr ÷ req/hr
+              single:  $0.00090/req → $0.90/1k
+              batched: $0.00017/req → $0.17/1k
+```
+T4 on-demand assumed at **$0.35/hour**. Substitute your provider's rate.
+</details>
+
+### Cost & latency breakdown
+
+**60% of the GPT-4o bill is prompt tax.** Of the $5.21 per 1,000 requests, $3.10 is
+re-transmitting a schema and a triage policy that never change. You pay it on every call,
+forever, and no prompting technique removes it — only moving those tokens into weights does.
+
+**Latency is prefill-bound, so the short prompt wins twice.** At ~196 prompt tokens the
+specialized model has roughly 7× less prefill than a prompted baseline at ~1,437. Projected
+TTFT on a T4 is **~200–300 ms** against **~1.1–2.0 s** for the prompted baseline on the same
+hardware. Sub-200 ms is realistic on an L4 or A10G, not reliably on a T4 — the notebook
+measures it rather than assuming it.
+
+**Where the honest limit is.** GPT-4o-mini at $0.31/1k **undercuts an unbatched self-hosted
+T4**. If your only argument is unit cost and your volume is low, mini wins and you should use
+it. Self-hosting wins on cost when you batch (~$0.17/1k, a 45× gap to GPT-4o-mini's
+per-request rate at scale), and `ftspec tco` computes the break-even volume for your numbers.
+
+**For regulated verticals the cost argument is secondary.** Cardholder and clinical data
+cannot be sent to a hosted API without an attestation or a BAA. There, the comparison table
+has empty columns by law, and a self-hosted specialized model is the only admissible design —
+which is why the benchmark refuses to fill them in.
+
+### Measured results
+
+<!-- BENCHMARK:BEGIN -->
+*Not yet populated.* Run
+[the Colab notebook](https://colab.research.google.com/github/Titos-papadakis/fine-tuning/blob/main/notebooks/colab_runner.ipynb);
+it writes a `measured_results.md` formatted to drop straight into this block, alongside the
+full matrix, every raw prediction, and a run manifest recording the git commit, config
+fingerprint, package versions and GPU.
+
+Pre-baked numbers in a vendor README are marketing. These are reproducible or they are
+nothing — and McNemar's exact test is wired in so a 4-point gap is not reported as a win.
+<!-- BENCHMARK:END -->
 
 ---
 
 ## Quickstart
+
+**No GPU?** [Open the notebook in Colab](https://colab.research.google.com/github/Titos-papadakis/fine-tuning/blob/main/notebooks/colab_runner.ipynb)
+— it clones, installs, trains and benchmarks end to end on a free T4 in ~30 minutes, then
+hands you a zip with the matrix, every raw prediction and a README-ready results block.
 
 ```bash
 pip install -e ".[train,constrained]"      # add ",serve" for vLLM, ",openai" for baselines
@@ -272,9 +357,12 @@ profiles/                      plug-and-play verticals
   saas_support/ fintech_disputes/ healthcare_clinical/
     {schema,rubric,scenarios,generate,profile}.py
 
+notebooks/
+  colab_runner.ipynb           free-T4 end-to-end run; generated by _build_notebook.py
 configs/                       typed YAML, validated with extra="forbid"
 data/<profile>/                generated corpora (committed; CI asserts reproducibility)
 outputs/<profile>/             checkpoints, reports, manifests (gitignored)
+examples/client.py             drop-in OpenAI SDK client
 tests/                         91 tests, CPU-only
 ```
 
@@ -291,8 +379,10 @@ Honest accounting of what has been executed versus what needs hardware:
 | Pipeline gates (`prepare`/`audit`/`validate`), incl. negative tests | ✅ each defect class injected and caught |
 | Serving layer: OpenAI shape, SSE streaming, schema enforcement | ✅ tested against a stubbed engine |
 | Compliance egress gate | ✅ verified to refuse, and to record the override |
+| Colab notebook: builds, all code cells parse, nbformat valid | ✅ structurally verified |
 | `ftspec train` on a real GPU | ⏳ requires CUDA hardware |
-| Benchmark matrix numbers | ⏳ produced by `ftspec evaluate` on your GPU |
+| Benchmark matrix numbers | ⏳ produced by the notebook or `ftspec evaluate` |
+| Projected economics table | ⚠️ modeled — token counts measured, throughput estimated |
 
 The entire CPU-side pipeline runs in CI on every commit, including a check that the committed
 corpora still match what the committed seed regenerates — so the benchmark stays reproducible
