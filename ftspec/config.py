@@ -57,7 +57,6 @@ class DataConfig(BaseModel):
 class TrainingConfig(BaseModel):
     model_config = STRICT
 
-    output_dir: str = "outputs/checkpoints"
     num_train_epochs: float = Field(default=3, gt=0)
     per_device_train_batch_size: int = Field(default=2, gt=0)
     per_device_eval_batch_size: int = Field(default=2, gt=0)
@@ -85,10 +84,19 @@ class TrainingConfig(BaseModel):
 
 
 class MergeConfig(BaseModel):
+    """Artefact names only.
+
+    Full paths are composed by `Config` from the active profile, so training
+    and evaluation cannot disagree about where the adapter lives. They used to:
+    training wrote outputs/<profile>/lora_adapter while evaluation defaulted to
+    outputs/lora_adapter, and the mismatch only surfaced after a GPU had already
+    been paid for.
+    """
     model_config = STRICT
 
-    adapter_dir: str = "outputs/lora_adapter"
-    merged_dir: str = "outputs/merged_model"
+    adapter_name: str = "lora_adapter"
+    merged_name: str = "merged_model"
+    checkpoints_name: str = "checkpoints"
     save_merged_16bit: bool = True
 
 
@@ -124,6 +132,31 @@ class Config(BaseModel):
     def resolve(self, relative: str) -> Path:
         path = Path(relative)
         return path if path.is_absolute() else REPO_ROOT / path
+
+    # --- artefact layout -----------------------------------------------------
+    # Every stage derives its paths from here. Adding a path anywhere else is
+    # how train and evaluate drifted apart the first time.
+
+    def data_dir(self, profile_name: str) -> Path:
+        return self.resolve(self.data.dir_for(profile_name))
+
+    def outputs_dir(self, profile_name: str) -> Path:
+        return self.resolve(f"outputs/{profile_name}")
+
+    def adapter_dir(self, profile_name: str) -> Path:
+        return self.outputs_dir(profile_name) / self.merge.adapter_name
+
+    def merged_dir(self, profile_name: str) -> Path:
+        return self.outputs_dir(profile_name) / self.merge.merged_name
+
+    def checkpoints_dir(self, profile_name: str) -> Path:
+        return self.outputs_dir(profile_name) / self.merge.checkpoints_name
+
+    def reports_dir(self, profile_name: str) -> Path:
+        return self.outputs_dir(profile_name) / "reports"
+
+    def manifests_dir(self, profile_name: str) -> Path:
+        return self.outputs_dir(profile_name) / "manifests"
 
 
 def load_config(path: Path | None = None) -> Config:

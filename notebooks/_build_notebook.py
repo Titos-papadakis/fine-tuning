@@ -206,6 +206,12 @@ for label, system_prompt in (("specialized", profile.prompts.short),
     print(f"{label:20s} prompt={m['prompt_tokens']:5d} tok   "
           f"TTFT p50={m['ttft_p50_ms']:5d} ms   decode={m['decode_tok_s']:6.1f} tok/s")
 
+# `ftspec report` reads this to build the README block, so the notebook and a
+# local run emit byte-identical output.
+Path(f"outputs/{PROFILE}/reports").mkdir(parents=True, exist_ok=True)
+Path(f"outputs/{PROFILE}/reports/latency.json").write_text(
+    json.dumps(latency, indent=2), encoding="utf-8")
+
 del model
 torch.cuda.empty_cache()
 """))
@@ -236,82 +242,34 @@ display(Markdown(Path(f"outputs/{PROFILE}/reports/benchmark_report.md").read_tex
 cells.append(md("""
 ## 8 · Build the README block and save every artifact
 
-Writes `measured_results.md` in exactly the shape the repository README expects, so the
-projected figures published there can be replaced with numbers this run actually produced.
+`ftspec report` turns the run manifest and the latency measurements into the block the
+repository README expects, and `--update-readme` splices it in between the BENCHMARK markers,
+replacing the projections that ship with the repo.
+
+The block is built by the engine rather than by this notebook, so a local run and a Colab run
+produce identical output and every published number traces to one code path.
 """))
 cells.append(code("""
+!ftspec report --profile $PROFILE --gpu-cost-per-hour 0.35 --update-readme
+"""))
+
+cells.append(code("""
 import shutil
-import subprocess
-
-GPU_HOURLY = 0.35                  # T4 on-demand; set to your provider's rate
-GPT4O_IN, GPT4O_OUT = 2.50, 10.00  # USD per 1M tokens
-
-manifest = json.loads(
-    Path(f"outputs/{PROFILE}/manifests/evaluate.json").read_text(encoding="utf-8"))
-systems = manifest["metrics"]["systems"]
-finetuned = systems.get("finetuned", {})
-
-spec = latency["specialized"]
-prompted = latency["prompted_baseline"]
-out_tokens = finetuned.get("mean_output_tokens") or 162
-
-# Self-hosted cost from measured single-stream throughput. Deliberately
-# conservative: continuous batching in production is materially cheaper.
-sec_per_req = spec["ttft_p50_ms"] / 1000 + out_tokens / max(spec["decode_tok_s"], 1e-6)
-self_hosted_per_req = GPU_HOURLY / (3600 / sec_per_req)
-gpt4o_per_req = (prompted["prompt_tokens"] / 1e6 * GPT4O_IN) + (out_tokens / 1e6 * GPT4O_OUT)
-saving = 100 * (gpt4o_per_req - self_hosted_per_req) / gpt4o_per_req
-
-gpu_name = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                           capture_output=True, text=True).stdout.strip()
-
-lines = [
-    "### Measured results",
-    "",
-    f"Produced by `notebooks/colab_runner.ipynb` on **{gpu_name}**, profile `{PROFILE}`, "
-    f"n = {manifest['metrics']['n_eval']} held-out documents. Reproduce with the Colab badge above.",
-    "",
-    "| Metric | Specialized 8B | Prompted baseline |",
-    "|---|---:|---:|",
-    f"| System prompt tokens | {spec['prompt_tokens']} | {prompted['prompt_tokens']} |",
-    f"| TTFT p50 | {spec['ttft_p50_ms']} ms | {prompted['ttft_p50_ms']} ms |",
-    f"| TTFT max | {spec['ttft_max_ms']} ms | {prompted['ttft_max_ms']} ms |",
-    f"| Decode throughput | {spec['decode_tok_s']} tok/s | {prompted['decode_tok_s']} tok/s |",
-    "",
-    "| System | Schema adherence | Record exact | p50 | p99 | Cost / 1k |",
-    "|---|---:|---:|---:|---:|---:|",
-]
-for name, s in systems.items():
-    lines.append(f"| `{name}` | {s['schema_adherence_pct']}% | {s['record_exact_pct']}% | "
-                  f"{s['p50_ms']:.0f} ms | {s['p99_ms']:.0f} ms | "
-                  f"${s['cost_per_100k_usd'] / 100:.3f} |")
-lines += [
-    "",
-    f"**Cost per request** — self-hosted ${self_hosted_per_req:.5f} vs GPT-4o "
-    f"${gpt4o_per_req:.5f} (**{saving:.0f}% reduction**), at ${GPU_HOURLY:.2f}/hour and the "
-    "measured single-stream throughput above. Continuous batching lowers the self-hosted "
-    "figure further.",
-    "",
-]
-block = "\\n".join(lines)
 
 artifacts = Path("/content/ftspec_artifacts")
 artifacts.mkdir(exist_ok=True)
-(artifacts / "measured_results.md").write_text(block, encoding="utf-8")
-(artifacts / "latency_raw.json").write_text(json.dumps(latency, indent=2), encoding="utf-8")
+
+# The spliced README section, extracted so it can be pasted anywhere.
+readme = Path("README.md").read_text(encoding="utf-8")
+block = readme.split("<!-- BENCHMARK:BEGIN -->")[1].split("<!-- BENCHMARK:END -->")[0]
+(artifacts / "measured_results.md").write_text(block.strip() + "\\n", encoding="utf-8")
+
 for src in (Path(f"outputs/{PROFILE}/reports"), Path(f"outputs/{PROFILE}/manifests")):
     if src.exists():
         shutil.copytree(src, artifacts / src.name, dirs_exist_ok=True)
+shutil.copy("README.md", artifacts / "README_with_results.md")
 
 print(block)
-"""))
-
-cells.append(code("""
-from google.colab import files
-
-archive = shutil.make_archive("/content/ftspec_results", "zip", "/content/ftspec_artifacts")
-print(f"{archive}  ({Path(archive).stat().st_size / 1024:.0f} KB)")
-files.download(archive)
 """))
 
 cells.append(md("""

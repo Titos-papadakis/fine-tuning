@@ -35,7 +35,6 @@ data:
   root: "data"
 
 training:
-  output_dir: "outputs/checkpoints"       # per-profile at runtime
   num_train_epochs: 3
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 4          # effective batch size 8
@@ -58,9 +57,11 @@ training:
   train_on_responses_only: true           # mask the prompt out of the loss
 
 merge:
-  # Artefact paths are derived per profile: outputs/<profile>/lora_adapter etc.
-  adapter_dir: "outputs/lora_adapter"
-  merged_dir: "outputs/merged_model"      # what `ftspec serve` loads
+  # Names only. Full paths are composed per profile by ftspec.config.Config,
+  # so training and evaluation can never disagree about where the adapter is:
+  #   outputs/<profile>/lora_adapter, outputs/<profile>/merged_model
+  adapter_name: "lora_adapter"
+  merged_name: "merged_model"             # what `ftspec serve` loads
   save_merged_16bit: true
 
 preflight:

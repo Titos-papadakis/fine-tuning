@@ -53,6 +53,24 @@ jobs:
             echo "OK: $p refused egress as expected"
           done
 
+      - name: Prompt-tax audit runs on a synthetic log
+        run: |
+          python - <<'EOF'
+          import json
+          preamble = "You are an engine. Schema: " + json.dumps({"a": {"type": "string"}}) * 20
+          rows = [{"messages": [{"role": "system", "content": preamble},
+                                {"role": "user", "content": f"req {i}"},
+                                {"role": "assistant", "content": "{}"}]} for i in range(40)]
+          open("/tmp/log.jsonl", "w").write("
+".join(json.dumps(r) for r in rows))
+          EOF
+          ftspec prompt-audit /tmp/log.jsonl --calls-per-month 100000 | tee /tmp/audit.md
+          grep -q "Static prefix" /tmp/audit.md
+          # The report must never leak prompt text unless explicitly asked.
+          if grep -q "You are an engine" /tmp/audit.md; then
+            echo "FAIL: audit report leaked prompt content by default"; exit 1
+          fi
+
       - name: Notebook must match its generator
         # The .ipynb is generated, not hand-edited. If this fails, someone edited
         # the notebook directly and the change would be lost on next regeneration.

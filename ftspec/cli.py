@@ -8,6 +8,8 @@
     ftspec train    --profile X        QLoRA fine-tune
     ftspec evaluate --profile X        benchmark matrix
     ftspec tco                         break-even analysis
+    ftspec report   --profile X        splice measured results into the README
+    ftspec prompt-audit <log.jsonl>    measure the prompt tax on your own logs
     ftspec infer    --profile X        one document, constrained decoding
     ftspec serve    --profile X        OpenAI-compatible endpoint
 
@@ -77,9 +79,7 @@ def _resolve(config: Path | None, profile_name: str | None,
     except Exception as e:
         typer.secho(str(e), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from e
-    data_dir = cfg.resolve(cfg.data.dir_for(profile.name))
-    outputs = cfg.resolve(f"outputs/{profile.name}")
-    return cfg, profile, data_dir, outputs
+    return cfg, profile, cfg.data_dir(profile.name), cfg.outputs_dir(profile.name)
 
 
 def _manifest_path(outputs: Path, stage: str) -> Path:
@@ -218,8 +218,7 @@ def train(
                        params={"profile": prof.name, "max_steps": max_steps, "resume": resume,
                                 "skip_validation": skip_validation,
                                 "base_model": cfg.model.base_model}) as manifest:
-        manifest.metrics = train_mod.run(cfg, data_dir, outputs,
-                                          max_steps=max_steps, resume=resume)
+        manifest.metrics = train_mod.run(cfg, prof.name, max_steps=max_steps, resume=resume)
 
 
 # --- evaluate ----------------------------------------------------------------
@@ -245,7 +244,7 @@ def evaluate(
 
     cfg, prof, data_dir, outputs = _resolve(config, profile, schema)
     eval_file = data_dir / "eval.jsonl"
-    reports_dir = outputs / "reports"
+    reports_dir = cfg.reports_dir(prof.name)
 
     if self_test:
         records = benchmark.load_eval_set(eval_file, limit)
@@ -261,7 +260,7 @@ def evaluate(
             manifest.metrics = benchmark.run(
                 profile=prof, eval_file=eval_file, results_dir=reports_dir,
                 systems=systems, base_model=base_model,
-                finetuned_model=finetuned_model or str(cfg.resolve(cfg.merge.adapter_dir)),
+                finetuned_model=finetuned_model or str(cfg.adapter_dir(prof.name)),
                 limit=limit, gpu_cost_per_hour=gpu_cost_per_hour,
                 max_new_tokens=max_new_tokens, acknowledge_egress=acknowledge_egress,
             )
@@ -297,6 +296,67 @@ def tco(
             training_cost, amortise_months, prompt_tokens_api, output_tokens)
         manifest.metrics = metrics
     typer.echo(report)
+
+
+# --- prompt-audit ------------------------------------------------------------
+
+@app.command(name="prompt-audit")
+def prompt_audit(
+    file: Path = typer.Argument(..., help="JSONL of your prompts. Never leaves this machine."),
+    model: str = typer.Option("gpt-4o", help="Model whose pricing to apply."),
+    calls_per_month: int = typer.Option(100_000, help="Your call volume."),
+    include_sample: bool = typer.Option(
+        False, help="Include the first 400 chars of the static prefix in the report."),
+    out: Path | None = typer.Option(None, help="Write the markdown report to a file."),
+):
+    """Measure how much of your prompt bill re-sends content that never changes.
+
+    Runs entirely locally. Accepts {"messages": [...]}, {"system", "user"} or
+    {"prompt"} shapes, so most prompt logs work without reshaping.
+    """
+    from ftspec import prompt_audit as audit_mod
+
+    try:
+        report, _ = audit_mod.run(file, model, calls_per_month, include_sample, out)
+    except (ValueError, FileNotFoundError) as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+
+    typer.echo(report)
+
+
+# --- report ------------------------------------------------------------------
+
+@app.command()
+def report(
+    profile: str | None = ProfileOpt,
+    schema: Path | None = SchemaOpt,
+    config: Path | None = ConfigOpt,
+    readme: Path = typer.Option(REPO_ROOT / "README.md", help="File to splice results into."),
+    gpu_cost_per_hour: float = typer.Option(0.35),
+    latency_file: Path | None = typer.Option(
+        None, help="latency.json from the Colab notebook; enables the TTFT table."),
+    update_readme: bool = typer.Option(
+        False, "--update-readme", help="Write the block into README between the markers."),
+):
+    """Turn the last evaluate run into the README's measured-results block."""
+    from ftspec import reporting
+
+    cfg, prof, _, _ = _resolve(config, profile, schema)
+    try:
+        block, changed = reporting.run(cfg, prof.name, readme, gpu_cost_per_hour,
+                                        latency_file, write=update_readme)
+    except (FileNotFoundError, ValueError) as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+
+    typer.echo(block)
+    if update_readme:
+        verb = "updated" if changed else "no change to"
+        typer.secho(f"\n{verb} {readme}",
+                     fg=typer.colors.GREEN if changed else None)
+    else:
+        typer.echo("\n(preview only — pass --update-readme to write it in)")
 
 
 # --- infer -------------------------------------------------------------------

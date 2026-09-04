@@ -18,8 +18,6 @@ job is an expensive place to discover a truncated sample.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 from ftspec.config import Config
 from ftspec.run import get_logger
 
@@ -42,8 +40,8 @@ def detect_family(model_name: str) -> str:
     return ""
 
 
-def run(cfg: Config, data_dir: Path, outputs_dir: Path,
-         max_steps: int = -1, resume: bool = False) -> dict:
+def run(cfg: Config, profile_name: str, max_steps: int = -1,
+         resume: bool = False) -> dict:
     """Fine-tune and save adapters. Returns metrics for the run manifest."""
     # Heavy imports are deferred so `--help`, config validation and CI linting
     # do not require a CUDA toolchain to be installed.
@@ -80,6 +78,7 @@ def run(cfg: Config, data_dir: Path, outputs_dir: Path,
     log.info("trainable parameters: %s / %s (%.3f%%)",
               f"{trainable:,}", f"{total:,}", 100 * trainable / total)
 
+    data_dir = cfg.data_dir(profile_name)
     log.info("loading corpus from %s", data_dir)
     dataset = load_dataset("json", data_files={
         "train": str(data_dir / "train.jsonl"),
@@ -94,7 +93,7 @@ def run(cfg: Config, data_dir: Path, outputs_dir: Path,
     dataset = dataset.map(format_chat, remove_columns=dataset["train"].column_names)
 
     sft_config = SFTConfig(
-        output_dir=str(outputs_dir / "checkpoints"),
+        output_dir=str(cfg.checkpoints_dir(profile_name)),
         num_train_epochs=t.num_train_epochs,
         max_steps=max_steps,
         per_device_train_batch_size=t.per_device_train_batch_size,
@@ -148,7 +147,7 @@ def run(cfg: Config, data_dir: Path, outputs_dir: Path,
 
     train_output = trainer.train(resume_from_checkpoint=resume or None)
 
-    adapter_dir = outputs_dir / "lora_adapter"
+    adapter_dir = cfg.adapter_dir(profile_name)
     adapter_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
@@ -156,7 +155,7 @@ def run(cfg: Config, data_dir: Path, outputs_dir: Path,
 
     merged_dir = None
     if cfg.merge.save_merged_16bit:
-        merged_dir = outputs_dir / "merged_model"
+        merged_dir = cfg.merged_dir(profile_name)
         merged_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained_merged(str(merged_dir), tokenizer, save_method="merged_16bit")
         log.info("saved merged 16-bit model -> %s  (ready for `ftspec serve`)", merged_dir)
