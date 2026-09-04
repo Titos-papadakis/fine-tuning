@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Run outputs: checkpoints, merged weights, reports, manifests.
+# Regenerate with `ftspec train` / `ftspec eval`; never commit weights.
+outputs/
+*.bin
+*.safetensors
+*.pt
+wandb/
+
+# NOTE: data/*.jsonl IS committed on purpose. It is a deliverable of the PoC and
+# CI asserts it matches what the committed seed regenerates, so the benchmark
+# stays reproducible from source.
+
+.DS_Store
+.idea/
+.vscode/

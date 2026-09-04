@@ -1,0 +1,70 @@
+# Default pipeline configuration.
+#
+# Validated against ftspec.config.Config before anything loads: an unknown key
+# is an error, not a warning. A silent typo like `learning_rte: 2e-4` would
+# otherwise cost a GPU-hour and produce a model trained at the default rate,
+# with nothing in the logs to say so.
+#
+# Defaults are tuned to fit comfortably on a single 16GB T4 (Colab free tier).
+# Override per-run from the CLI:  ftspec train -c configs/default.yaml
+
+model:
+  # Unsloth-maintained 4-bit prequantized checkpoints download faster and use
+  # less VRAM. Swap for "unsloth/Qwen2.5-7B-Instruct-bnb-4bit" to train Qwen;
+  # the chat-template response markers are detected automatically.
+  base_model: "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
+  max_seq_length: 2048
+  load_in_4bit: true
+  dtype: null            # null = auto (bfloat16 where supported, else float16)
+
+lora:
+  r: 16
+  lora_alpha: 16
+  lora_dropout: 0.0
+  bias: "none"
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  use_gradient_checkpointing: "unsloth"   # ~30% less VRAM than HF's default
+  random_state: 42
+
+# Which vertical this config targets; --profile overrides it.
+profile: "saas_support"
+
+data:
+  # Corpora live under data/<profile>/, so switching verticals never silently
+  # trains on the previous one's data.
+  root: "data"
+
+training:
+  output_dir: "outputs/checkpoints"       # per-profile at runtime
+  num_train_epochs: 3
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4          # effective batch size 8
+  per_device_eval_batch_size: 2
+  gradient_checkpointing: true
+  learning_rate: 2.0e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  optim: "adamw_8bit"                     # 8-bit optimizer state fits T4 VRAM
+  logging_steps: 5
+  eval_strategy: "steps"
+  eval_steps: 20
+  save_strategy: "steps"
+  save_steps: 20
+  save_total_limit: 2
+  seed: 42
+  packing: false                          # clean instruction boundaries
+  report_to: "none"
+  train_on_responses_only: true           # mask the prompt out of the loss
+
+merge:
+  # Artefact paths are derived per profile: outputs/<profile>/lora_adapter etc.
+  adapter_dir: "outputs/lora_adapter"
+  merged_dir: "outputs/merged_model"      # what `ftspec serve` loads
+  save_merged_16bit: true
+
+preflight:
+  # Enforced by `ftspec validate` before any GPU is allocated.
+  max_prompt_tokens: 1536
+  max_total_tokens: 2048                  # must not exceed model.max_seq_length
+  max_truncated_fraction: 0.0             # zero tolerance: truncation is silent corruption

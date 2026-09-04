@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # The entire CPU-side pipeline runs without a GPU or an API key by design:
+    # a prospect can verify the methodology in CI before installing CUDA.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,custom]" fastapi httpx
+
+      - name: Lint
+        run: ruff check ftspec profiles tests
+
+      - name: Tests
+        run: pytest -q
+
+      - name: Pipeline gates for every profile
+        run: |
+          for p in saas_support fintech_disputes healthcare_clinical; do
+            echo "::group::$p"
+            ftspec prepare  --profile "$p"
+            ftspec audit    --profile "$p"
+            ftspec validate --profile "$p" --approx
+            ftspec evaluate --profile "$p" --self-test
+            echo "::endgroup::"
+          done
+
+      - name: Compliance gate must refuse hosted baselines for regulated profiles
+        run: |
+          for p in fintech_disputes healthcare_clinical; do
+            if ftspec evaluate --profile "$p" --systems gpt4o-rubric --limit 1; then
+              echo "FAIL: $p did not refuse a hosted baseline"; exit 1
+            fi
+            echo "OK: $p refused egress as expected"
+          done
+
+      - name: Committed corpora must match what the committed seed regenerates
+        # If this fails, someone hand-edited data or changed a generator without
+        # regenerating -- either way the benchmark is no longer reproducible.
+        run: git diff --exit-code -- data/

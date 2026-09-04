@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ftspec"
+version = "1.0.0"
+description = "Enterprise SLM specialization engine: modular domain adapters for schema-constrained extraction"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# Core: dataset generation, validation, metrics, TCO. CPU-only, no GPU needed.
+# This is deliberately small so a prospect can verify the methodology before
+# installing a CUDA toolchain.
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6.0.1",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.2.0",
+    "transformers>=4.44.0",
+    "trl>=0.9.6",
+    "peft>=0.12.0",
+    "accelerate>=0.33.0",
+    "bitsandbytes>=0.43.1",
+    "datasets>=2.20.0",
+    "sentencepiece>=0.2.0",
+    "unsloth",
+]
+serve = [
+    "vllm>=0.6.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "transformers>=4.44.0",
+]
+constrained = [
+    "outlines>=0.1.0",
+]
+openai = [
+    "openai>=1.40.0",
+]
+custom = [
+    # Needed only for `--profile custom`, which validates against a raw
+    # JSON Schema rather than a Pydantic model.
+    "jsonschema>=4.21.0",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+ftspec = "ftspec.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["ftspec*", "profiles*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer declares options as function-call defaults; that is its documented API,
+# not an accident. Scoped to the CLI so genuine B008 elsewhere still surfaces.
+"ftspec/cli.py" = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
