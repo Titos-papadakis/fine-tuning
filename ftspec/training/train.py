@@ -18,6 +18,8 @@ job is an expensive place to discover a truncated sample.
 """
 from __future__ import annotations
 
+import inspect
+
 from ftspec.config import Config
 from ftspec.run import get_logger
 
@@ -38,6 +40,42 @@ def detect_family(model_name: str) -> str:
     if "llama" in lowered:
         return "llama"
     return ""
+
+
+# TRL renames arguments across releases: SFTConfig.max_seq_length became
+# max_length, and SFTTrainer.tokenizer became processing_class. `unsloth` does
+# not pin TRL, so a fresh Colab install picks up whatever is current that week
+# and an unknown keyword is a TypeError before the first step runs.
+#
+# Each entry lists accepted spellings oldest-first. The old name is preferred
+# while it still exists, so during a deprecation window we keep passing the
+# argument this code was written against rather than guessing at a new one that
+# might mean something else.
+SFT_CONFIG_ALIASES = {"max_seq_length": ("max_seq_length", "max_length")}
+TRAINER_ALIASES = {"tokenizer": ("tokenizer", "processing_class")}
+
+
+def adapt_kwargs(target, kwargs: dict, aliases: dict) -> dict:
+    """Rename or drop keyword arguments the installed TRL does not accept."""
+    try:
+        accepted = set(inspect.signature(target).parameters)
+    except (TypeError, ValueError):
+        return kwargs                       # un-introspectable: pass through unchanged
+    if "kwargs" in accepted:
+        return kwargs                       # **kwargs swallows everything; do not second-guess
+
+    adapted = {}
+    for key, value in kwargs.items():
+        for candidate in aliases.get(key, (key,)):
+            if candidate in accepted:
+                adapted[candidate] = value
+                if candidate != key:
+                    log.info("TRL renamed %s -> %s in this version", key, candidate)
+                break
+        else:
+            log.warning("%s does not accept %r in this version; dropping it",
+                         getattr(target, "__name__", target), key)
+    return adapted
 
 
 def run(cfg: Config, profile_name: str, max_steps: int = -1,
@@ -92,7 +130,14 @@ def run(cfg: Config, profile_name: str, max_steps: int = -1,
     # remove_columns drops `meta`, which exists for analysis and must not reach the trainer.
     dataset = dataset.map(format_chat, remove_columns=dataset["train"].column_names)
 
-    sft_config = SFTConfig(
+    # T4 is sm_75: no bf16. Probed rather than assumed, and guarded because the
+    # call raises on a CPU-only torch build.
+    try:
+        bf16 = bool(torch.cuda.is_bf16_supported())
+    except Exception:
+        bf16 = False
+
+    sft_config = SFTConfig(**adapt_kwargs(SFTConfig, dict(
         output_dir=str(cfg.checkpoints_dir(profile_name)),
         num_train_epochs=t.num_train_epochs,
         max_steps=max_steps,
@@ -116,17 +161,17 @@ def run(cfg: Config, profile_name: str, max_steps: int = -1,
         report_to=t.report_to,
         max_seq_length=m.max_seq_length,
         dataset_text_field="text",
-        fp16=not torch.cuda.is_bf16_supported(),
-        bf16=torch.cuda.is_bf16_supported(),
-    )
+        fp16=not bf16,
+        bf16=bf16,
+    ), SFT_CONFIG_ALIASES))
 
-    trainer = SFTTrainer(
+    trainer = SFTTrainer(**adapt_kwargs(SFTTrainer, dict(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset["train"],
         eval_dataset=dataset["validation"],
         args=sft_config,
-    )
+    ), TRAINER_ALIASES))
 
     if t.train_on_responses_only:
         family = detect_family(m.base_model)
@@ -153,16 +198,36 @@ def run(cfg: Config, profile_name: str, max_steps: int = -1,
     tokenizer.save_pretrained(str(adapter_dir))
     log.info("saved LoRA adapter -> %s", adapter_dir)
 
+    # The 16-bit merge dequantises the whole base model, so it needs roughly 16GB
+    # for an 8B — on a free T4 that is the single most likely point of failure in
+    # this pipeline, and it happens *after* training has already succeeded.
+    #
+    # The adapter is on disk by now and `ftspec evaluate` runs from it, so a failed
+    # merge costs the serving artefact and nothing else. Losing an hour of GPU time
+    # to a traceback at the finish line would be the expensive outcome, so the merge
+    # is contained rather than allowed to take the run down with it.
     merged_dir = None
+    merge_error = None
     if cfg.merge.save_merged_16bit:
-        merged_dir = cfg.merged_dir(profile_name)
-        merged_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained_merged(str(merged_dir), tokenizer, save_method="merged_16bit")
-        log.info("saved merged 16-bit model -> %s  (ready for `ftspec serve`)", merged_dir)
+        target = cfg.merged_dir(profile_name)
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()    # hand back the training cache first
+            target.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained_merged(str(target), tokenizer, save_method="merged_16bit")
+            merged_dir = target
+            log.info("saved merged 16-bit model -> %s  (ready for `ftspec serve`)", target)
+        except Exception as e:                                    # noqa: BLE001
+            merge_error = f"{type(e).__name__}: {e}"
+            log.error("16-bit merge failed: %s", merge_error)
+            log.error("The adapter is saved and intact at %s — `ftspec evaluate` and "
+                       "`ftspec report` work from it directly. Re-run the merge on a "
+                       "larger machine, or set merge.save_merged_16bit=false to skip it.",
+                       adapter_dir)
 
     peak_vram = (torch.cuda.max_memory_reserved() / 1024 ** 3) if torch.cuda.is_available() else 0.0
     return {
-        "profile": cfg.profile,
+        "profile": profile_name,
         "train_runtime_s": round(train_output.metrics.get("train_runtime", 0.0), 1),
         "train_loss": round(train_output.metrics.get("train_loss", 0.0), 5),
         "trainable_params": trainable,
@@ -170,4 +235,5 @@ def run(cfg: Config, profile_name: str, max_steps: int = -1,
         "peak_vram_gb": round(peak_vram, 2),
         "adapter_dir": str(adapter_dir),
         "merged_dir": str(merged_dir) if merged_dir else None,
+        "merge_error": merge_error,
     }

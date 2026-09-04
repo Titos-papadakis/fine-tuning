@@ -24,3 +24,6 @@ wandb/
 .DS_Store
 .idea/
 .vscode/
+
+# Local-only working material, not part of the engine.
+sales/

@@ -61,14 +61,26 @@ jobs:
           rows = [{"messages": [{"role": "system", "content": preamble},
                                 {"role": "user", "content": f"req {i}"},
                                 {"role": "assistant", "content": "{}"}]} for i in range(40)]
-          open("/tmp/log.jsonl", "w").write("
-".join(json.dumps(r) for r in rows))
+          with open("/tmp/log.jsonl", "w") as fh:
+              for row in rows:
+                  fh.write(json.dumps(row) + chr(10))
           EOF
           ftspec prompt-audit /tmp/log.jsonl --calls-per-month 100000 | tee /tmp/audit.md
           grep -q "Static prefix" /tmp/audit.md
           # The report must never leak prompt text unless explicitly asked.
           if grep -q "You are an engine" /tmp/audit.md; then
             echo "FAIL: audit report leaked prompt content by default"; exit 1
+          fi
+
+      - name: README test count must match reality
+        # The count is a claim in a sales-facing document. Letting it drift is a
+        # small lie that a prospect can check with one command.
+        run: |
+          actual=$(pytest -q 2>&1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')
+          claimed=$(grep -oE '[0-9]+ tests, CPU-only' README.md | head -1 | grep -oE '^[0-9]+')
+          echo "README claims $claimed, suite has $actual"
+          if [ "$actual" != "$claimed" ]; then
+            echo "FAIL: README says $claimed tests, the suite has $actual"; exit 1
           fi
 
       - name: Notebook must match its generator
