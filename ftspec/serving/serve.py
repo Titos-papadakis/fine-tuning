@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -102,6 +103,24 @@ class ServerState:
     system_prompt: str = ""
     served_requests: int = 0
     constrained_requests: int = 0
+    backend: str = "vllm"
+    # Non-vLLM engines (a transformers pipeline, a mock) supply their own
+    # sampling-parameter object. Set this and the vLLM import is never reached,
+    # which is what lets one wire implementation serve every backend instead of
+    # each backend growing its own copy of /v1/chat/completions.
+    params_builder: Any = None
+    started_at: float = field(default_factory=time.time)
+    # Bounded on purpose: /health reports recent behaviour, and an unbounded
+    # list on a long-lived server is a slow memory leak.
+    latencies_ms: deque = field(default_factory=lambda: deque(maxlen=512))
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(int(round((pct / 100.0) * (len(ordered) - 1))), len(ordered) - 1)
+    return round(ordered[idx], 1)
 
 
 STATE = ServerState()
@@ -115,6 +134,9 @@ def build_sampling_params(req: ChatCompletionRequest, constrained: bool):
     detection keeps this working on both rather than pinning the customer to
     whichever version we happened to develop against.
     """
+    if STATE.params_builder is not None:
+        return STATE.params_builder(req, constrained)
+
     from vllm import SamplingParams
 
     kwargs: dict = {
@@ -171,6 +193,7 @@ async def generate_once(req: ChatCompletionRequest) -> tuple[str, int, int]:
     constrained = not req.ftspec_unconstrained
     params = build_sampling_params(req, constrained)
     request_id = f"ftspec-{uuid.uuid4().hex[:12]}"
+    start = time.perf_counter()
 
     final = None
     async for output in STATE.engine.generate(prompt, params, request_id,
@@ -185,6 +208,7 @@ async def generate_once(req: ChatCompletionRequest) -> tuple[str, int, int]:
     completion_tokens = len(final.outputs[0].token_ids or [])
 
     STATE.served_requests += 1
+    STATE.latencies_ms.append((time.perf_counter() - start) * 1000)
     if constrained:
         STATE.constrained_requests += 1
     else:
@@ -204,13 +228,34 @@ def create_app(respect_client_system_prompt: bool = False):
 
     @app.get("/health")
     async def health():
+        """Liveness plus enough metadata to tell two deployments apart.
+
+        A load balancer needs the status field. An operator staring at a wrong
+        answer needs to know *which* profile and backend actually answered, and
+        whether latency has moved — so both are here rather than in a separate
+        metrics endpoint nobody has wired up yet.
+        """
         profile = STATE.profile
+        recent = list(STATE.latencies_ms)
         return {"status": "ok" if STATE.engine is not None else "loading",
                 "model": STATE.model_name,
+                "backend": STATE.backend,
                 "profile": profile.name if profile else None,
                 "regime": profile.compliance.regime if profile else None,
+                "allows_external_api": profile.compliance.allows_external_api
+                                        if profile else None,
                 "schema_enforced": True,
-                "lora": STATE.lora_request is not None}
+                "schema_fields": sorted(STATE.schema.get("properties", {})),
+                "lora": STATE.lora_request is not None,
+                "uptime_s": round(time.time() - STATE.started_at, 1),
+                "latency_ms": {"count": len(recent),
+                                "p50": _percentile(recent, 50),
+                                "p99": _percentile(recent, 99),
+                                "last": round(recent[-1], 1) if recent else 0.0},
+                "requests": {"served": STATE.served_requests,
+                              "constrained": STATE.constrained_requests,
+                              "unconstrained": STATE.served_requests
+                                                - STATE.constrained_requests}}
 
     @app.get("/v1/models")
     async def list_models():
