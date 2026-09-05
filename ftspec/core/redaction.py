@@ -37,11 +37,23 @@ PATTERNS = {
     # No leading \b: there is no word boundary between a space and "(", so a
     # \b-anchored pattern silently misses the very common "(555) 123-4567" form.
     # Digit lookaround instead, which anchors correctly in every format.
+    # Separator set includes "." because 555.123.4567 is written that way often
+    # enough that omitting it is a hole, not a simplification.
     "phone": re.compile(
-        r"(?<!\d)(?:\+\d{1,3}[ -]?)?(?:\(\d{3}\)[ -]?|\d{3}[ -])\d{3}[ -]?\d{4}(?!\d)"),
-    "iban": re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b"),
+        r"(?<!\d)(?:\+\d{1,3}[ .-]?)?(?:\(\d{3}\)[ .-]?|\d{3}[ .-])\d{3}[ .-]?\d{4}(?!\d)"),
+    # Grouped in fours is how an IBAN is written by a human, and a transcript is
+    # written by humans. The unspaced machine form stays covered by the same
+    # pattern; the [A-Z]{2}\d{2} anchor must be contiguous, which is what keeps
+    # this off ordinary prose.
+    "iban": re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\b"),
     "nhs_mrn": re.compile(r"\b(?:MRN|NHS)[ :#-]*\d{6,10}\b", re.IGNORECASE),
-    "dob": re.compile(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b"),
+    # ISO plus the slash forms. Under HIPAA Safe Harbor a date of birth is an
+    # identifier regardless of how it is punctuated, and clinical free text uses
+    # slashes far more than ISO.
+    "dob": re.compile(
+        r"\b(?:(?:19|20)\d{2}-\d{2}-\d{2}"
+        r"|\d{1,2}/\d{1,2}/(?:19|20)\d{2}"
+        r"|(?:19|20)\d{2}/\d{1,2}/\d{1,2})\b"),
 }
 
 

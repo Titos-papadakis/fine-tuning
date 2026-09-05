@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import statistics
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -95,6 +96,7 @@ def parse_samples(path: Path) -> list:
     """Read prompts from the shapes a real prompt log actually arrives in."""
     samples: list = []
     skipped = 0
+    empty = 0
 
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -122,9 +124,23 @@ def parse_samples(path: Path) -> list:
             samples.append(Sample("", row["prompt"], row.get("completion", "")))
         else:
             skipped += 1
+            continue
+
+        # A row whose prompt is empty is not a prompt record -- an empty
+        # messages list, a stripped health-check call, a truncated export. Kept
+        # in the sample it is catastrophic rather than merely noisy: the shared
+        # prefix is the prefix common to *every* sample, so one empty string
+        # drives it to zero and the audit confidently reports 0% static on a
+        # workload that is 99% static. Measured: 371 tokens -> 0 from a single
+        # bad row in 31.
+        if not samples[-1].full_prompt.strip():
+            samples.pop()
+            empty += 1
 
     if skipped:
         log.warning("skipped %d line(s) that matched no known prompt-log shape", skipped)
+    if empty:
+        log.warning("skipped %d line(s) carrying no prompt content", empty)
     return samples
 
 
@@ -141,6 +157,24 @@ def longest_common_prefix(texts: list) -> str:
         if any(t[i] != ch for t in texts):
             return shortest[:i]
     return shortest
+
+
+def dominant_prefix_group(prompts: list, probe: int = 200) -> tuple:
+    """The largest set of prompts that begin the same way.
+
+    The headline figure is the prefix shared by *every* sample, which is the
+    honest thing to report and also brittle: a handful of calls from a second
+    endpoint drag it to zero and the report says "0% static" about a log that is
+    mostly one very static workload. This finds the dominant cluster so the
+    warning can say how many calls are in it and how many are not, instead of
+    leaving the reader with a silently wrong number.
+    """
+    if not prompts:
+        return [], 0
+    heads = Counter(p[:probe] for p in prompts)
+    head, _ = heads.most_common(1)[0]
+    group = [p for p in prompts if p.startswith(head)]
+    return group, len(group)
 
 
 def audit(samples: list, model: str = "gpt-4o") -> AuditResult:
@@ -163,6 +197,21 @@ def audit(samples: list, model: str = "gpt-4o") -> AuditResult:
             "prompts, or the log interleaves several distinct workloads — audit each "
             "workload separately for a real number."
         )
+        # Say *why* it collapsed. "0% static" with no explanation reads as a
+        # clean bill of health; it usually means two workloads in one file.
+        group, n_group = dominant_prefix_group(prompts)
+        if 2 <= n_group < len(prompts):
+            group_static = longest_common_prefix(group)
+            if len(group_static) >= 40:
+                others = len(prompts) - n_group
+                warnings.append(
+                    f"{n_group} of {len(prompts)} calls ({n_group / len(prompts):.0%}) do share "
+                    f"a {count_tokens(group_static)}-token prefix. The remaining "
+                    f"{others} call{'' if others == 1 else 's'} do{'es' if others == 1 else ''} "
+                    "not, and that is what pulled the figure above to near zero — the headline "
+                    "is the prefix common to every call, so a single outlier removes it. "
+                    "Re-run on the dominant workload alone for a figure that means something."
+                )
 
     static_tokens = count_tokens(static)
     variable_tokens = round(statistics.mean(

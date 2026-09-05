@@ -53,8 +53,11 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str = "ftspec-extractor"
     messages: list[ChatMessage]
-    temperature: float = 0.0
-    top_p: float = 1.0
+    # Bounded like the API this is wire-compatible with. Unbounded, a negative
+    # temperature reached vLLM and came back as a 500; the caller deserves the
+    # 422 that says which field was wrong.
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     max_tokens: int = Field(default=512, gt=0, le=4096)
     stream: bool = False
     # Extension: allows a caller to opt OUT of the schema guarantee explicitly.
@@ -312,9 +315,11 @@ def create_app(respect_client_system_prompt: bool = False):
             yield f"data: {json.dumps(first)}\n\n"
 
             prompt = render_prompt(req.messages)
-            params = build_sampling_params(req, not req.ftspec_unconstrained)
+            constrained = not req.ftspec_unconstrained
+            params = build_sampling_params(req, constrained)
             request_id = f"ftspec-{uuid.uuid4().hex[:12]}"
             emitted = 0
+            start = time.perf_counter()
             try:
                 async for output in STATE.engine.generate(prompt, params, request_id,
                                                            lora_request=STATE.lora_request):
@@ -336,7 +341,19 @@ def create_app(respect_client_system_prompt: bool = False):
                      "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             yield f"data: {json.dumps(done)}\n\n"
             yield "data: [DONE]\n\n"
+
+            # Streamed requests are accounted exactly like non-streamed ones.
+            # Counting served without counting constrained put every stream in
+            # the unconstrained column -- on a regulated profile that is a false
+            # compliance alarm, raised by the very endpoint an auditor reads.
+            # Latency was missing for the same reason, which excluded streaming
+            # from p50/p99 precisely where latency matters most.
             STATE.served_requests += 1
+            STATE.latencies_ms.append((time.perf_counter() - start) * 1000)
+            if constrained:
+                STATE.constrained_requests += 1
+            else:
+                log.warning("request %s served UNCONSTRAINED at client request", request_id)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 

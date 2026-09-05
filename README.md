@@ -430,7 +430,7 @@ configs/                       typed YAML, validated with extra="forbid"
 data/<profile>/                generated corpora (committed; CI asserts reproducibility)
 outputs/<profile>/             checkpoints, reports, manifests (gitignored)
 examples/client.py             drop-in OpenAI SDK client
-tests/                         158 tests, CPU-only
+tests/                         203 tests, CPU-only
 ```
 
 ---
@@ -441,7 +441,7 @@ Honest accounting of what has been executed versus what needs hardware:
 
 | | Status |
 |---|---|
-| Core engine, contracts, metric derivation, registry, redaction | ✅ 158 tests passing, CPU-only |
+| Core engine, contracts, metric derivation, registry, redaction | ✅ 203 tests passing, CPU-only |
 | All three profiles: generation, balance, groundedness, compliance | ✅ verified end-to-end |
 | Pipeline gates (`prepare`/`audit`/`validate`), incl. negative tests | ✅ each defect class injected and caught |
 | Serving layer: OpenAI shape, SSE streaming, schema enforcement | ✅ tested against a stubbed engine |
