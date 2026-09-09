@@ -30,6 +30,7 @@ cannot lose is a benchmark nobody believes.
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import statistics
@@ -155,6 +156,14 @@ def run_local(spec: SystemSpec, records: list, profile: Profile,
     plan = profile.scoring_plan()
     system_prompt = profile.prompts.variants()[spec.prompt_variant]
 
+    if torch.cuda.is_available():
+        free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+        log.info("  %.1f GB free before loading %s", free_gb, spec.name)
+        if free_gb < 5:
+            log.warning("  under 5GB free before %s -- a prior system's memory may not "
+                         "have been fully released; loading may fall back to CPU/disk "
+                         "offload and run drastically slower, or fail", spec.name)
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=spec.model, max_seq_length=4096, load_in_4bit=True)
     FastLanguageModel.for_inference(model)
@@ -194,9 +203,24 @@ def run_local(spec: SystemSpec, records: list, profile: Profile,
         result.valid_flags.append(1.0 if valid else 0.0)
         result.scores.append(M.score_record(pred if valid else None, gold, plan))
 
-    del model
+    # Confirmed on a real T4: `del model; empty_cache()` alone was not enough to
+    # free the first system's VRAM before the second system's model loaded --
+    # Unsloth/PEFT keep additional references (compiled kernels, the grammar
+    # generator's closure over `model`) alive past the `del`. `del` only drops
+    # one reference; if that leaves a cycle, only `gc.collect()` actually
+    # reclaims it, and a pending kernel can hold the allocator open until
+    # `synchronize()` drains the queue -- each step here closes one real gap,
+    # not defensive boilerplate.
+    del model, tokenizer
+    if generator is not None:
+        del generator
+    gc.collect()
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        gc.collect()
+        free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+        log.info("  freed GPU memory after %s; %.1f GB now free", spec.name, free_gb)
     return result
 
 
@@ -259,7 +283,7 @@ def _ci(stat: M.FieldStat) -> str:
 
 
 def render_report(results: dict, profile: Profile, gpu_cost_per_hour: float,
-                   n_eval: int, refused: list) -> str:
+                   n_eval: int, refused: list, failed: dict | None = None) -> str:
     order = [n for n in system_catalogue() if n in results]
     plan = profile.scoring_plan()
     headline = plan.headline()
@@ -285,6 +309,16 @@ def render_report(results: dict, profile: Profile, gpu_cost_per_hour: float,
                   "API at lower cost'. The hosted options are not lawfully available for this "
                   "data, so a self-hosted specialized model is the only admissible design. "
                   "Cost is a secondary argument here, not the primary one.")
+        L.append("")
+
+    if failed:
+        L.append("## Systems that failed to run")
+        L.append("")
+        L.append("Shown rather than hidden: a benchmark that quietly drops a system it "
+                  "couldn't run is indistinguishable from one that never tried.")
+        L.append("")
+        for name, msg in failed.items():
+            L.append(f"- `{name}`: {msg}")
         L.append("")
 
     L.append("## What is measured")
@@ -442,6 +476,7 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
     headline = profile.scoring_plan().headline()
     results: dict = {}
     refused: list = []
+    failed: dict = {}
 
     for name in requested:
         spec = catalogue[name]
@@ -464,8 +499,24 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
                              name, profile.compliance.regime)
 
         log.info("running %s (prompt=%s, model=%s)", name, spec.prompt_variant, spec.model)
-        result = run_openai(spec, records, profile) if spec.is_hosted \
-            else run_local(spec, records, profile, max_new_tokens)
+        try:
+            result = run_openai(spec, records, profile) if spec.is_hosted \
+                else run_local(spec, records, profile, max_new_tokens)
+        except Exception as e:                                        # noqa: BLE001
+            # One system's OOM should not discard the systems that already
+            # succeeded. Confirmed on a real T4: without this, a crash loading
+            # the *second* model of three took a completed first result down
+            # with it -- no report was written at all despite real data existing.
+            log.error("  %s FAILED: %s: %s", name, type(e).__name__, e)
+            failed[name] = f"{type(e).__name__}: {e}"
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+            continue
 
         if headline:
             result.gold_headline = [
@@ -482,6 +533,10 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
             raise RuntimeError(
                 "Every requested system was refused by the compliance gate.\n"
                 + profile.compliance.egress_refusal())
+        if failed:
+            raise RuntimeError(
+                "Every requested system failed to run:\n"
+                + "\n".join(f"  {n}: {msg}" for n, msg in failed.items()))
         raise RuntimeError("No systems ran. Check --systems and credentials.")
 
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -491,10 +546,14 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
                 f.write(json.dumps({"output": raw, "scores": score, "latency_ms": latency},
                                     ensure_ascii=False) + "\n")
 
-    report = render_report(results, profile, gpu_cost_per_hour, len(records), refused)
+    report = render_report(results, profile, gpu_cost_per_hour, len(records), refused, failed)
     out = results_dir / "benchmark_report.md"
     out.write_text(report + "\n", encoding="utf-8")
     log.info("matrix written -> %s", out)
+    if failed:
+        log.warning("wrote a partial matrix: %d of %d requested systems failed (%s). "
+                    "Re-run with --systems limited to the failed ones once fixed.",
+                    len(failed), len(requested), ", ".join(failed))
 
     return {
         "profile": profile.name,
@@ -502,6 +561,7 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
         "n_eval": len(records),
         "report_path": str(out),
         "refused_for_compliance": refused,
+        "failed_systems": failed,
         "egress_acknowledged": acknowledge_egress,
         "systems": {
             name: {
