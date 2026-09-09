@@ -77,6 +77,13 @@ cells.append(code(f"""
 !pip install -q --no-deps "trl<0.12" peft accelerate bitsandbytes
 !pip install -q outlines jsonschema
 
+# transformers' Trainer accepts the legacy tokenizer= kwarg (which unsloth's
+# compiled trainer still passes internally) only up to version 5 -- past that
+# it is a hard TypeError, confirmed against a real T4 run. Colab's preinstalled
+# transformers regularly outpaces this, so it is capped explicitly rather than
+# left to whatever pip resolves that week.
+!pip install -q "transformers<5"
+
 !git clone -q {REPO}.git /content/ftspec
 %cd /content/ftspec
 !pip install -q -e .

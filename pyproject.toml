@@ -22,7 +22,11 @@ dependencies = [
 [project.optional-dependencies]
 train = [
     "torch>=2.2.0",
-    "transformers>=4.44.0",
+    # <5: HF's Trainer accepts the legacy tokenizer= kwarg (that unsloth's
+    # compiled trainer still passes internally) only via a deprecate_kwarg
+    # shim scoped to version="5.0.0" -- past that it is a hard TypeError.
+    # Confirmed against transformers' own source, and against a real T4 run.
+    "transformers>=4.44.0,<5",
     "trl>=0.9.6",
     "peft>=0.12.0",
     "accelerate>=0.33.0",
@@ -35,7 +39,7 @@ serve = [
     "vllm>=0.6.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
-    "transformers>=4.44.0",
+    "transformers>=4.44.0,<5",
 ]
 constrained = [
     "outlines>=0.1.0",
