@@ -542,9 +542,17 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
     results_dir.mkdir(parents=True, exist_ok=True)
     for name, r in results.items():
         with open(results_dir / f"raw_{name}.jsonl", "w", encoding="utf-8") as f:
-            for raw, score, latency in zip(r.raw_outputs, r.scores, r.latencies_ms, strict=True):
-                f.write(json.dumps({"output": raw, "scores": score, "latency_ms": latency},
-                                    ensure_ascii=False) + "\n")
+            # valid/prompt_tokens/output_tokens are persisted (not just used in
+            # memory) so a system run in its own process -- the reliable way to
+            # dodge the cross-model VRAM issue below -- can still be folded back
+            # into one combined report later, by `combine()`, without re-running
+            # any generation.
+            for raw, score, latency, valid, p_tok, o_tok in zip(
+                    r.raw_outputs, r.scores, r.latencies_ms, r.valid_flags,
+                    r.prompt_tokens, r.output_tokens, strict=True):
+                f.write(json.dumps({"output": raw, "scores": score, "latency_ms": latency,
+                                     "valid": bool(valid), "prompt_tokens": p_tok,
+                                     "output_tokens": o_tok}, ensure_ascii=False) + "\n")
 
     report = render_report(results, profile, gpu_cost_per_hour, len(records), refused, failed)
     out = results_dir / "benchmark_report.md"
@@ -563,19 +571,122 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
         "refused_for_compliance": refused,
         "failed_systems": failed,
         "egress_acknowledged": acknowledge_egress,
-        "systems": {
-            name: {
-                "schema_adherence_pct": round(r.adherence_pct, 2),
-                "record_exact_pct": round(100 * r.agg.record_exact.mean, 2),
-                "headline_field": headline.path if headline else None,
-                "headline_accuracy_pct": round(100 * r.agg.field_mean(headline.path), 2)
-                if headline else None,
-                "p50_ms": round(r.p50, 1),
-                "p99_ms": round(r.p99, 1),
-                "mean_prompt_tokens": round(r.mean_prompt_tokens, 1),
-                "cost_per_100k_usd": round(cost_per_100k(r, gpu_cost_per_hour), 2),
-            } for name, r in results.items()
-        },
+        "systems": _summarize_systems(results, headline, gpu_cost_per_hour),
+    }
+
+
+def _summarize_systems(results: dict, headline, gpu_cost_per_hour: float) -> dict:
+    """The per-system numbers that go in a run manifest. Shared by `run()` and
+    `combine()` so the two paths can never quietly drift apart."""
+    return {
+        name: {
+            "schema_adherence_pct": round(r.adherence_pct, 2),
+            "record_exact_pct": round(100 * r.agg.record_exact.mean, 2),
+            "headline_field": headline.path if headline else None,
+            "headline_accuracy_pct": round(100 * r.agg.field_mean(headline.path), 2)
+            if headline else None,
+            "p50_ms": round(r.p50, 1),
+            "p99_ms": round(r.p99, 1),
+            "mean_prompt_tokens": round(r.mean_prompt_tokens, 1),
+            "cost_per_100k_usd": round(cost_per_100k(r, gpu_cost_per_hour), 2),
+        } for name, r in results.items()
+    }
+
+
+# --- Combine: fold separately-run systems back into one report ---------------
+#
+# Running each system as its own `!ftspec evaluate --systems X` process is the
+# reliable fix for the cross-model VRAM problem: a fresh process guarantees a
+# clean CUDA context regardless of what the previous system's cleanup managed
+# to free. The cost is that each invocation only knows about the one system it
+# ran, so `benchmark_report.md` and the manifest only ever hold the last one.
+#
+# `combine()` reads every already-written `raw_<name>.jsonl` back off disk and
+# rebuilds the same RunResult objects `run()` would have held in memory, so it
+# can call the *same* `render_report()` and get the identical rich comparison
+# -- confidence intervals, McNemar, per-field breakdown -- that a single
+# combined run would have produced. No model loads, no GPU needed: this is
+# pure arithmetic over already-generated text, so it cannot itself OOM.
+
+def load_run_result_from_disk(name: str, results_dir: Path, records: list,
+                               profile: Profile, headline) -> RunResult | None:
+    """Reconstruct a RunResult from a previous system-scoped `run()`'s raw file.
+
+    Returns None if that system was never run (no raw file yet), so callers can
+    report "not yet run" rather than crashing on a combine attempted too early.
+    """
+    path = results_dir / f"raw_{name}.jsonl"
+    if not path.exists():
+        return None
+
+    catalogue = system_catalogue()
+    result = RunResult(spec=catalogue[name])
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        result.raw_outputs.append(row["output"])
+        result.scores.append(row["scores"])
+        result.latencies_ms.append(row["latency_ms"])
+        result.valid_flags.append(1.0 if row.get("valid") else 0.0)
+        result.prompt_tokens.append(row.get("prompt_tokens", 0))
+        result.output_tokens.append(row.get("output_tokens", 0))
+
+    if len(result.raw_outputs) != len(records):
+        log.warning("raw_%s.jsonl has %d records but the eval set has %d -- "
+                    "was it run against a different --limit or a stale eval file?",
+                    name, len(result.raw_outputs), len(records))
+
+    if headline:
+        result.gold_headline = [
+            M.get_path(json.loads(r["messages"][2]["content"]), headline.path)
+            for r in records[:len(result.raw_outputs)]]
+    result.agg = M.aggregate(result.scores, profile.scoring_plan())
+    return result
+
+
+def combine(profile: Profile, eval_file: Path, results_dir: Path,
+            systems: str, gpu_cost_per_hour: float = 0.35) -> dict:
+    """Assemble one report from systems that were each run in their own process."""
+    records = load_eval_set(eval_file)
+    headline = profile.scoring_plan().headline()
+    requested = [s.strip() for s in systems.split(",") if s.strip()]
+    catalogue = system_catalogue()
+    unknown = [s for s in requested if s not in catalogue]
+    if unknown:
+        raise ValueError(f"Unknown system(s): {unknown}. Available: {list(catalogue)}")
+
+    results: dict = {}
+    missing: list = []
+    for name in requested:
+        result = load_run_result_from_disk(name, results_dir, records, profile, headline)
+        if result is None:
+            missing.append(name)
+        else:
+            results[name] = result
+
+    if not results:
+        raise FileNotFoundError(
+            f"None of {requested} have a raw_<name>.jsonl in {results_dir} yet. "
+            "Run `ftspec evaluate --systems <name>` for each one first.")
+    if missing:
+        log.warning("combining without %s -- no raw file found for them yet; "
+                    "the report below covers only %s", missing, list(results))
+
+    report = render_report(results, profile, gpu_cost_per_hour, len(records), refused=[])
+    out = results_dir / "benchmark_report.md"
+    out.write_text(report + "\n", encoding="utf-8")
+    log.info("combined matrix written -> %s (%d/%d requested systems)",
+              out, len(results), len(requested))
+
+    return {
+        "profile": profile.name,
+        "regime": profile.compliance.regime,
+        "n_eval": len(records),
+        "report_path": str(out),
+        "combined_from_disk": True,
+        "missing_systems": missing,
+        "systems": _summarize_systems(results, headline, gpu_cost_per_hour),
     }
 
 

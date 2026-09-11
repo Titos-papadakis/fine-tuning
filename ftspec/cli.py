@@ -273,6 +273,52 @@ def evaluate(
             raise typer.Exit(code=1) from e
 
 
+# --- combine-eval --------------------------------------------------------------
+
+@app.command(name="combine-eval")
+def combine_eval(
+    profile: str | None = ProfileOpt,
+    schema: Path | None = SchemaOpt,
+    config: Path | None = ConfigOpt,
+    systems: str = typer.Option(
+        "finetuned,base-constrained,base-rubric",
+        help="Comma-separated system names to fold together."),
+    gpu_cost_per_hour: float = typer.Option(0.35),
+):
+    """Combine systems that were each run with a separate `evaluate` call.
+
+    Running every system in one `evaluate` process is fine when it fits: a
+    fine-tuned adapter and two base-model baselines loaded back to back can
+    exceed a small GPU's VRAM even though each one fits alone, because a
+    prior model's memory is not always fully released before the next loads.
+    Running each system as its own `evaluate` invocation sidesteps that
+    entirely -- a fresh process gets a clean CUDA context -- at the cost of
+    each run only knowing about the one system it ran.
+
+    This reads every already-written raw_<name>.jsonl back off disk and
+    produces the same combined report `evaluate` would have, including the
+    full statistical treatment: no model loads, so it cannot itself run out
+    of memory.
+    """
+    from ftspec.evaluation import benchmark
+
+    cfg, prof, _, outputs = _resolve(config, profile, schema)
+    eval_file = cfg.data_dir(prof.name) / "eval.jsonl"
+    reports_dir = cfg.reports_dir(prof.name)
+
+    with run_manifest("evaluate", _manifest_path(outputs, "evaluate"), cfg.fingerprint(),
+                       params={"profile": prof.name, "systems": systems,
+                                "combined_from_disk": True}) as manifest:
+        try:
+            manifest.metrics = benchmark.combine(
+                profile=prof, eval_file=eval_file, results_dir=reports_dir,
+                systems=systems, gpu_cost_per_hour=gpu_cost_per_hour)
+        except (FileNotFoundError, ValueError) as e:
+            manifest.metrics = {"error": str(e), "profile": prof.name}
+            typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from e
+
+
 # --- tco ---------------------------------------------------------------------
 
 @app.command()

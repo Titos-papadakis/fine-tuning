@@ -232,9 +232,42 @@ adherence is reported as a baseline here and not as the result. What separates t
 is whether the extracted **values** are correct.
 
 McNemar's exact test is included so a small gap is not reported as a win.
+
+**Each system runs in its own cell, on purpose.** A free T4 has ~14.5GB of VRAM; each 8B model
+here needs roughly 5-6GB, so any one of them fits with room to spare — but loading a second
+model in the *same* process, right after the first, does not reliably get that first model's
+memory back. `del model; torch.cuda.empty_cache()` between systems is not always enough, and
+when it falls short the symptom is `accelerate` silently falling back to CPU/disk offload,
+which is catastrophically slow and can abort the run outright with no `benchmark_report.md` at
+all — confirmed on this exact hardware, not a hypothetical.
+
+Running each system as its own `evaluate` invocation sidesteps the problem entirely: a fresh
+process gets a fresh CUDA context, so there is nothing left over for the next model to compete
+with. The cost is that each cell only knows about the one system it ran — `combine-eval` below
+folds all three back into the single report `evaluate` would have produced if it fit in one
+process, with the same confidence intervals and significance test, computed purely from the
+already-generated text on disk. No model loads for that step, so it cannot itself run out of
+memory.
 """))
 cells.append(code("""
-!ftspec evaluate --profile $PROFILE \\
+!ftspec evaluate --profile $PROFILE --systems finetuned --gpu-cost-per-hour 0.35
+"""))
+cells.append(code("""
+!ftspec evaluate --profile $PROFILE --systems base-constrained --gpu-cost-per-hour 0.35
+"""))
+cells.append(code("""
+!ftspec evaluate --profile $PROFILE --systems base-rubric --gpu-cost-per-hour 0.35
+"""))
+
+cells.append(md("""
+## 6b · Combine the three into one matrix
+
+Reads back the `raw_<system>.jsonl` each cell above just wrote and rebuilds the comparison —
+no GPU involved, so if a cell above failed this still runs and reports on whichever systems did
+succeed rather than leaving nothing at all.
+"""))
+cells.append(code("""
+!ftspec combine-eval --profile $PROFILE \\
     --systems finetuned,base-constrained,base-rubric \\
     --gpu-cost-per-hour 0.35
 """))
