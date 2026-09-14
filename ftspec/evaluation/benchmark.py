@@ -61,6 +61,7 @@ class SystemSpec:
     model: str
     prompt_variant: str     # "short" | "schema" | "schema+rubric"
     constrained: bool = False
+    load_in_4bit: bool = True  # False = fp16 inference, for the quantization-vs-quality tradeoff
 
     @property
     def is_hosted(self) -> bool:
@@ -165,7 +166,7 @@ def run_local(spec: SystemSpec, records: list, profile: Profile,
                          "offload and run drastically slower, or fail", spec.name)
 
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=spec.model, max_seq_length=4096, load_in_4bit=True)
+        model_name=spec.model, max_seq_length=4096, load_in_4bit=spec.load_in_4bit)
     FastLanguageModel.for_inference(model)
 
     generator = None
@@ -462,8 +463,17 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
          limit: int | None = None,
          gpu_cost_per_hour: float = 0.35,
          max_new_tokens: int = 512,
-         acknowledge_egress: bool = False) -> dict:
-    """Run the requested systems and write the comparison matrix."""
+         acknowledge_egress: bool = False,
+         load_in_4bit: bool = True,
+         constrained: bool | None = None) -> dict:
+    """Run the requested systems and write the comparison matrix.
+
+    `load_in_4bit` and `constrained` override every *local* system's
+    quantization and decoding strategy uniformly (default: catalogue as-is,
+    identical to every call before these existed). This is how
+    ftplatform's Stage C measures the same trained adapter under a
+    quantization or constrained-decoding toggle without a new backend.
+    """
     catalogue = system_catalogue()
     records = load_eval_set(eval_file, limit)
     log.info("loaded %d eval documents from %s", len(records), eval_file)
@@ -482,6 +492,10 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
         spec = catalogue[name]
         spec.model = finetuned_model if name == "finetuned" else (
             base_model if spec.backend == "local" else spec.model)
+        if spec.backend == "local":
+            spec.load_in_4bit = load_in_4bit
+            if constrained is not None:
+                spec.constrained = constrained
 
         if spec.is_hosted:
             # Compliance gate: regulated data does not leave the boundary on a

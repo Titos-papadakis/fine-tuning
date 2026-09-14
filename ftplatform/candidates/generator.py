@@ -69,3 +69,34 @@ def stage_b_candidates(base_model: str,
     `base_model` -- normally the Stage-A leaderboard's winning model."""
     return [StageBCandidate(f"stageB-r{r}-a{alpha}", base_model, r, alpha)
             for r, alpha in grid]
+
+
+# --- Stage C: inference-time toggles, no training -------------------------
+#
+# For the Stage-B winner's already-trained adapter only: does quantization
+# (4bit vs fp16) or grammar-constrained decoding change the cost/quality
+# tradeoff enough to matter? Purely inference-time -- each combo is one
+# `ftspec.evaluation.benchmark.run()` call with its load_in_4bit/constrained
+# overrides, no new backend, no GPU-hour spent on training.
+
+DEFAULT_STAGE_C_COMBOS: tuple[tuple[str, bool], ...] = (
+    ("4bit", True), ("fp16", False), ("fp16", True),
+)  # ("4bit", False) is what Stage B already measured -- not repeated here.
+
+
+@dataclass(frozen=True)
+class StageCCandidate:
+    candidate_id: str
+    quantization: str  # "4bit" | "fp16"
+    constrained: bool
+
+    @property
+    def load_in_4bit(self) -> bool:
+        return self.quantization == "4bit"
+
+
+def stage_c_candidates(prefix: str = "stageC",
+                         combos: tuple[tuple[str, bool], ...] = DEFAULT_STAGE_C_COMBOS
+                         ) -> list[StageCCandidate]:
+    return [StageCCandidate(f"{prefix}-{q}-{'constrained' if c else 'unconstrained'}", q, c)
+            for q, c in combos]

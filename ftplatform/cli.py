@@ -251,6 +251,68 @@ def candidate_lora_grid():
     typer.echo("")
 
 
+@candidate_app.command("stage-c")
+def candidate_stage_c(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    winner: str = typer.Option(..., help="candidate_id of an already-trained Stage-B adapter."),
+    quantization: str = typer.Option(..., help="'4bit' or 'fp16'."),
+    constrained: bool = typer.Option(..., help="Grammar-constrained decoding on/off."),
+    candidate_id: str | None = typer.Option(
+        None, help="Defaults to 'stageC-<quantization>-<un/constrained>'."),
+    gpu_cost_per_hour: float = typer.Option(0.35),
+):
+    """Re-evaluate a trained adapter under one quantization/constrained toggle.
+
+    No training -- one evaluate pass against the adapter --winner already
+    produced. `ftplatform candidate stage-c-combos` lists the default
+    3-combo sweep (the 4th, 4bit+unconstrained, is what Stage B already
+    measured).
+    """
+    from ftplatform.candidates import runner
+    from ftplatform.candidates.generator import StageCCandidate
+
+    if quantization not in ("4bit", "fp16"):
+        typer.secho("--quantization must be '4bit' or 'fp16'", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    cid = candidate_id or f"stageC-{quantization}-{'constrained' if constrained else 'unconstrained'}"
+    candidate = StageCCandidate(cid, quantization, constrained)
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    finally:
+        conn.close()
+
+    try:
+        result = runner.run_stage_c_candidate(ctx, winner, candidate,
+                                                 gpu_cost_per_hour=gpu_cost_per_hour)
+    except (RuntimeError, ValueError, FileNotFoundError) as e:
+        typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+
+    typer.echo(f"\ncandidate {cid!r} recorded for {customer_id!r} "
+                f"(quantization={quantization}, constrained={constrained})")
+    for name, m in result["systems"].items():
+        typer.echo(f"  {name:<18} adherence={m['schema_adherence_pct']:.1f}%  "
+                    f"record_exact={m['record_exact_pct']:.1f}%  "
+                    f"cost/100k=${m['cost_per_100k_usd']:.2f}")
+
+
+@candidate_app.command("stage-c-combos")
+def candidate_stage_c_combos():
+    """Show the default Stage-C quantization/constrained-decoding combos."""
+    from ftplatform.candidates.generator import DEFAULT_STAGE_C_COMBOS
+
+    typer.echo(f"\n  {'quantization':<14} constrained")
+    for q, c in DEFAULT_STAGE_C_COMBOS:
+        typer.echo(f"  {q:<14} {c}")
+    typer.echo("")
+
+
 @leaderboard_app.command("build")
 def leaderboard_build(
     customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),

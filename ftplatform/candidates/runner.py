@@ -166,6 +166,41 @@ def run_stage_b_candidate(ctx: CustomerContext, candidate, max_steps: int = -1,
     return result
 
 
+def run_stage_c_candidate(ctx: CustomerContext, winner_candidate_id: str, candidate,
+                            gpu_cost_per_hour: float = 0.35, max_new_tokens: int = 512) -> dict:
+    """Re-evaluate an already-trained Stage-B winner's adapter under one
+    quantization/constrained-decoding toggle. Purely inference-time -- no
+    training, reusing `benchmark.run()`'s additive `load_in_4bit`/
+    `constrained` overrides, so it costs one evaluate pass, not a retrain.
+
+    `candidate` is a `ftplatform.candidates.generator.StageCCandidate`.
+    """
+    adapter_dir = ctx.adapter_dir(winner_candidate_id)
+    if not adapter_dir.exists():
+        raise FileNotFoundError(
+            f"no trained adapter for candidate {winner_candidate_id!r} at {adapter_dir}. "
+            f"Run `ftplatform candidate stage-b` for it first.")
+
+    eval_file = ctx.data_dir() / "eval.jsonl"
+    manifests_dir = ctx.manifests_dir(candidate.candidate_id)
+    fingerprint = ctx.config.fingerprint()
+
+    with run_manifest("evaluate", manifests_dir / "evaluate.json", fingerprint,
+                       params={"customer": ctx.customer.id, "candidate_id": candidate.candidate_id,
+                                "winner_candidate_id": winner_candidate_id,
+                                "quantization": candidate.quantization,
+                                "constrained": candidate.constrained}) as m:
+        result = benchmark.run(
+            profile=ctx.profile, eval_file=eval_file,
+            results_dir=ctx.reports_dir(candidate.candidate_id),
+            systems="finetuned", finetuned_model=str(adapter_dir),
+            load_in_4bit=candidate.load_in_4bit, constrained=candidate.constrained,
+            gpu_cost_per_hour=gpu_cost_per_hour, max_new_tokens=max_new_tokens,
+        )
+        m.metrics = result
+    return result
+
+
 def _write_baseline_snapshot(ctx: CustomerContext, result: dict) -> None:
     memory_dir = ctx.memory_dir()
     memory_dir.mkdir(parents=True, exist_ok=True)
