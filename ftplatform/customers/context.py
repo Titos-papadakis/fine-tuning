@@ -84,3 +84,6 @@ class CustomerContext:
 
     def memory_dir(self) -> Path:
         return self.config.resolve(f"customers/{self.customer.id}/memory")
+
+    def benchmark_dir(self) -> Path:
+        return self.config.resolve(f"customers/{self.customer.id}/benchmark")

@@ -29,6 +29,12 @@ app.add_typer(customer_app, name="customer")
 baseline_app = typer.Typer(help="Measure a customer's prompted-baseline systems.",
                             no_args_is_help=True)
 app.add_typer(baseline_app, name="baseline")
+candidate_app = typer.Typer(help="Generate and run optimization candidates.",
+                             no_args_is_help=True)
+app.add_typer(candidate_app, name="candidate")
+leaderboard_app = typer.Typer(help="Rank candidates that have already been run.",
+                               no_args_is_help=True)
+app.add_typer(leaderboard_app, name="leaderboard")
 
 log = get_logger("ftplatform.cli")
 
@@ -126,6 +132,100 @@ def baseline_run(
         typer.echo(f"  {name:<18} adherence={m['schema_adherence_pct']:.1f}%  "
                     f"record_exact={m['record_exact_pct']:.1f}%  "
                     f"cost/100k=${m['cost_per_100k_usd']:.2f}")
+
+
+@candidate_app.command("list-presets")
+def candidate_list_presets():
+    """List the built-in Stage-A candidate base models."""
+    from ftplatform.candidates.generator import DEFAULT_STAGE_A_CANDIDATES
+
+    typer.echo(f"\n  {'candidate_id':<20} {'label':<16} base_model")
+    typer.echo("  " + "-" * 80)
+    for c in DEFAULT_STAGE_A_CANDIDATES:
+        typer.echo(f"  {c.candidate_id:<20} {c.label:<16} {c.base_model}")
+    typer.echo("")
+
+
+@candidate_app.command("stage-a")
+def candidate_stage_a(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    base_model: str = typer.Option(..., help="Base model to evaluate, e.g. a preset's base_model."),
+    candidate_id: str | None = typer.Option(
+        None, help="Defaults to a slug derived from --base-model."),
+    systems: str = typer.Option("base-schema,base-rubric,base-constrained"),
+    gpu_cost_per_hour: float = typer.Option(0.35),
+):
+    """Evaluate one no-training candidate (a base model swap) for this customer.
+
+    Run once per candidate model, in its own process -- the same reason the
+    Colab notebook runs each system in its own cell. `ftplatform candidate
+    list-presets` shows a starting set of 2-3 model sizes; any base model
+    ftspec can load also works via --base-model.
+    """
+    from ftplatform.candidates import runner
+    from ftplatform.candidates.generator import StageACandidate, slugify_model
+
+    cid = candidate_id or slugify_model(base_model)
+    candidate = StageACandidate(cid, base_model, label=cid, systems=systems)
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    finally:
+        conn.close()
+
+    try:
+        result = runner.run_stage_a_candidate(ctx, candidate, gpu_cost_per_hour=gpu_cost_per_hour)
+    except (RuntimeError, ValueError, FileNotFoundError) as e:
+        typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+
+    typer.echo(f"\ncandidate {cid!r} recorded for {customer_id!r} ({base_model})")
+    for name, m in result["systems"].items():
+        typer.echo(f"  {name:<18} adherence={m['schema_adherence_pct']:.1f}%  "
+                    f"record_exact={m['record_exact_pct']:.1f}%  "
+                    f"cost/100k=${m['cost_per_100k_usd']:.2f}")
+
+
+@leaderboard_app.command("build")
+def leaderboard_build(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    candidates: str = typer.Option(
+        ..., help="Comma-separated candidate ids already run, e.g. "
+                   "'stageA-qwen25-3b,stageA-phi35-mini,stageA-llama31-8b'."),
+    min_adherence: float = typer.Option(98.0, help="Schema-adherence floor to survive ranking."),
+):
+    """Rank every system from the given already-run candidates together.
+
+    Reads each candidate's evaluate manifest back off disk -- no model
+    loads, so this cannot itself run out of memory. Writes
+    benchmark/leaderboard.{json,md}.
+    """
+    from ftplatform.candidates import leaderboard
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    finally:
+        conn.close()
+
+    ids = {c.strip(): c.strip() for c in candidates.split(",") if c.strip()}
+    try:
+        ranked = leaderboard.build(ctx, ids, min_adherence_pct=min_adherence)
+    except FileNotFoundError as e:
+        typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+
+    typer.echo(f"\ntop candidate: {ranked[0]['label']} / {ranked[0]['system']} "
+                f"(score={ranked[0]['score']})" if ranked and not ranked[0]["gated"]
+                else "\nno candidate survived the adherence floor")
+    typer.echo(leaderboard.render_markdown(ranked))
 
 
 if __name__ == "__main__":

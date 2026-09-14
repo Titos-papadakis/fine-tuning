@@ -87,6 +87,37 @@ def run_baseline(
     return result
 
 
+def run_stage_a_candidate(ctx: CustomerContext, candidate, gpu_cost_per_hour: float = 0.35) -> dict:
+    """Evaluate one Stage-A candidate (a base model swap, no training) against
+    the customer's existing held-out set.
+
+    `candidate` is a `ftplatform.candidates.generator.StageACandidate`.
+    Assumes the corpus already exists (`run_baseline()` or `ftspec prepare`
+    already built it) -- Stage A only evaluates, it never rebuilds data.
+    """
+    eval_file = ctx.data_dir() / "eval.jsonl"
+    if not eval_file.exists():
+        raise FileNotFoundError(
+            f"no eval set for customer {ctx.customer.id!r} at {eval_file}. "
+            f"Run `ftplatform baseline run {ctx.customer.id}` first.")
+
+    manifests_dir = ctx.manifests_dir(candidate.candidate_id)
+    reports_dir = ctx.reports_dir(candidate.candidate_id)
+    fingerprint = ctx.config.fingerprint()
+
+    with run_manifest("evaluate", manifests_dir / "evaluate.json", fingerprint,
+                       params={"customer": ctx.customer.id, "candidate_id": candidate.candidate_id,
+                                "base_model": candidate.base_model,
+                                "systems": candidate.systems}) as m:
+        result = benchmark.run(
+            profile=ctx.profile, eval_file=eval_file, results_dir=reports_dir,
+            systems=candidate.systems, base_model=candidate.base_model, finetuned_model=None,
+            gpu_cost_per_hour=gpu_cost_per_hour,
+        )
+        m.metrics = result
+    return result
+
+
 def _write_baseline_snapshot(ctx: CustomerContext, result: dict) -> None:
     memory_dir = ctx.memory_dir()
     memory_dir.mkdir(parents=True, exist_ok=True)
