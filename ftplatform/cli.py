@@ -47,6 +47,8 @@ app.add_typer(review_app, name="review")
 selfimprove_app = typer.Typer(help="Fold reviewed corrections back into training.",
                                no_args_is_help=True)
 app.add_typer(selfimprove_app, name="selfimprove")
+job_app = typer.Typer(help="The automation job queue.", no_args_is_help=True)
+app.add_typer(job_app, name="job")
 
 log = get_logger("ftplatform.cli")
 
@@ -685,6 +687,129 @@ def selfimprove_run(
         typer.secho(f"\nretrained candidate {result['candidate_id']!r} "
                      f"({result['folded']['added']} correction(s) folded) -- "
                      f"NOT promoted: {result['reason']}", fg=typer.colors.YELLOW)
+
+
+@app.command("approve")
+def approve_customer(customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'.")):
+    """Approve a customer for their first automated deployment.
+
+    Required exactly once, before the job worker will run a 'deploy' job
+    for a customer with no prior deployment (see jobs/approvals.py).
+    Deploying by hand (`ftplatform deploy run`) never needed this -- running
+    that command yourself already is the human decision; this is only for
+    the automated `job` pipeline.
+    """
+    from ftplatform.jobs import approvals
+
+    conn = connect()
+    try:
+        approvals.approve(conn, customer_id)
+    finally:
+        conn.close()
+    typer.secho(f"\n{customer_id!r} approved for automated deployment.", fg=typer.colors.GREEN)
+
+
+@job_app.command("enqueue")
+def job_enqueue(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    kind: str = typer.Option(
+        ..., help="baseline|stage_a|stage_b|stage_c|leaderboard|deploy|retrain_cycle"),
+    payload: str = typer.Option("{}", help="JSON kwargs for the job -- shape depends on --kind; "
+                                  "see jobs/worker.py::_dispatch for each kind's expected keys."),
+):
+    """Queue one unit of work for this customer. Nothing runs until a
+    worker (`job run-one` / `job worker`) picks it up."""
+    import json as json_mod
+
+    from ftplatform.jobs import queue
+
+    try:
+        payload_dict = json_mod.loads(payload)
+    except json_mod.JSONDecodeError as e:
+        typer.secho(f"--payload must be valid JSON: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+
+    conn = connect()
+    try:
+        job_id = queue.enqueue(conn, customer_id, kind, payload_dict)
+    finally:
+        conn.close()
+    typer.secho(f"\nqueued job {job_id!r} ({kind}) for {customer_id!r}.", fg=typer.colors.GREEN)
+
+
+@job_app.command("list")
+def job_list(customer_id: str | None = typer.Argument(None, help="Filter to one customer.")):
+    """List jobs, newest last."""
+    from ftplatform.jobs import queue
+
+    conn = connect()
+    try:
+        jobs = queue.list_jobs(conn, customer_id)
+    finally:
+        conn.close()
+
+    if not jobs:
+        typer.echo("no jobs")
+        return
+    typer.echo(f"\n  {'id':<18} {'customer':<12} {'kind':<16} {'status':<8} created")
+    typer.echo("  " + "-" * 80)
+    for j in jobs:
+        typer.echo(f"  {j['id']:<18} {j['customer_id']:<12} {j['kind']:<16} "
+                    f"{j['status']:<8} {j['created_at']}")
+    typer.echo("")
+
+
+@job_app.command("run-one")
+def job_run_one():
+    """Pop and execute the oldest pending job, then exit."""
+    from ftplatform.jobs import worker
+
+    conn = connect()
+    try:
+        job = worker.run_one(conn)
+    finally:
+        conn.close()
+
+    if job is None:
+        typer.echo("queue is empty")
+        return
+    color = typer.colors.GREEN if job["status"] == "done" else typer.colors.RED
+    typer.secho(f"\njob {job['id']!r} ({job['kind']}) -> {job['status']}", fg=color)
+    if job["status"] == "failed":
+        typer.echo(f"  {job['result']['error']}")
+
+
+@job_app.command("worker")
+def job_worker(
+    poll_interval_s: float = typer.Option(5.0),
+    max_jobs: int | None = typer.Option(None, help="Stop after this many jobs (default: run until empty)."),
+):
+    """Run jobs until the queue is empty. Meant for a long-lived process or
+    a Colab cell -- not for unattended overnight automation (see the
+    module's docstring on free Colab T4 session limits)."""
+    from ftplatform.jobs import worker
+
+    conn = connect()
+    try:
+        count = worker.run_loop(conn, poll_interval_s=poll_interval_s, max_jobs=max_jobs)
+    finally:
+        conn.close()
+    typer.echo(f"\nran {count} job(s); queue empty.")
+
+
+@job_app.command("requeue-stale")
+def job_requeue_stale(
+    stale_after_s: int = typer.Option(3600, help="How long 'running' before assuming the worker died."),
+):
+    """Mark 'running' jobs whose worker likely died as failed, for manual re-queue."""
+    from ftplatform.jobs import queue
+
+    conn = connect()
+    try:
+        stale_ids = queue.requeue_stale(conn, stale_after_s)
+    finally:
+        conn.close()
+    typer.echo(f"\n{len(stale_ids)} stale job(s) marked failed: {stale_ids}")
 
 
 if __name__ == "__main__":

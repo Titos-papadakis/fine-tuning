@@ -45,6 +45,28 @@ CREATE TABLE IF NOT EXISTS deployments (
     is_rollback   INTEGER NOT NULL DEFAULT 0,
     metrics_json  TEXT NOT NULL
 );
+
+-- Phase 7's job queue index. The job itself is just a row here (a JSON
+-- payload/result column, not a separate file) -- with expected volume this
+-- small, a second on-disk format would only be more to keep in sync.
+CREATE TABLE IF NOT EXISTS jobs (
+    id            TEXT PRIMARY KEY,
+    customer_id   TEXT NOT NULL REFERENCES customers(id),
+    kind          TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    payload_json  TEXT NOT NULL,
+    result_json   TEXT,
+    created_at    TEXT NOT NULL,
+    started_at    TEXT,
+    finished_at   TEXT
+);
+
+-- Phase 7's human-approval gate: a customer's very first deployment must be
+-- approved here before the worker will run a 'deploy' job for them.
+CREATE TABLE IF NOT EXISTS approvals (
+    customer_id   TEXT PRIMARY KEY REFERENCES customers(id),
+    approved_at   TEXT NOT NULL
+);
 """
 
 
