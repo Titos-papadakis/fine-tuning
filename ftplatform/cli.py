@@ -190,6 +190,67 @@ def candidate_stage_a(
                     f"cost/100k=${m['cost_per_100k_usd']:.2f}")
 
 
+@candidate_app.command("stage-b")
+def candidate_stage_b(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    base_model: str = typer.Option(
+        ..., help="Base model to train -- normally the Stage-A leaderboard's winner."),
+    lora_r: int = typer.Option(..., help="LoRA rank."),
+    lora_alpha: int = typer.Option(..., help="LoRA alpha."),
+    candidate_id: str | None = typer.Option(
+        None, help="Defaults to 'stageB-r<r>-a<alpha>'."),
+    max_steps: int = typer.Option(-1, help="Override epochs with a fixed step count."),
+    resume: bool = typer.Option(False, help="Resume from the latest checkpoint."),
+    gpu_cost_per_hour: float = typer.Option(0.35),
+):
+    """Train and evaluate one Stage-B LoRA candidate for this customer.
+
+    Run once per (r, alpha) point in the grid, in its own process, after a
+    corpus already exists (`ftplatform baseline run`). `ftplatform candidate
+    lora-grid` shows the default 3-point grid this trains for a fixed base
+    model.
+    """
+    from ftplatform.candidates import runner
+    from ftplatform.candidates.generator import StageBCandidate
+
+    cid = candidate_id or f"stageB-r{lora_r}-a{lora_alpha}"
+    candidate = StageBCandidate(cid, base_model, lora_r, lora_alpha)
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    finally:
+        conn.close()
+
+    try:
+        result = runner.run_stage_b_candidate(ctx, candidate, max_steps=max_steps,
+                                                resume=resume, gpu_cost_per_hour=gpu_cost_per_hour)
+    except (RuntimeError, ValueError, FileNotFoundError) as e:
+        typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+
+    typer.echo(f"\ncandidate {cid!r} trained and recorded for {customer_id!r} "
+                f"(r={lora_r}, alpha={lora_alpha})")
+    for name, m in result["systems"].items():
+        typer.echo(f"  {name:<18} adherence={m['schema_adherence_pct']:.1f}%  "
+                    f"record_exact={m['record_exact_pct']:.1f}%  "
+                    f"cost/100k=${m['cost_per_100k_usd']:.2f}")
+
+
+@candidate_app.command("lora-grid")
+def candidate_lora_grid():
+    """Show the default Stage-B LoRA (r, alpha) grid."""
+    from ftplatform.candidates.generator import DEFAULT_LORA_GRID
+
+    typer.echo(f"\n  {'r':>4} {'alpha':>6}")
+    for r, alpha in DEFAULT_LORA_GRID:
+        typer.echo(f"  {r:>4} {alpha:>6}")
+    typer.echo("")
+
+
 @leaderboard_app.command("build")
 def leaderboard_build(
     customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),

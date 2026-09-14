@@ -19,6 +19,7 @@ job is an expensive place to discover a truncated sample.
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 from ftspec.config import Config
 from ftspec.run import get_logger
@@ -79,8 +80,17 @@ def adapt_kwargs(target, kwargs: dict, aliases: dict) -> dict:
 
 
 def run(cfg: Config, profile_name: str, max_steps: int = -1,
-         resume: bool = False) -> dict:
-    """Fine-tune and save adapters. Returns metrics for the run manifest."""
+         resume: bool = False, data_dir: Path | None = None) -> dict:
+    """Fine-tune and save adapters. Returns metrics for the run manifest.
+
+    `profile_name` keys both the corpus location (`cfg.data_dir`) and every
+    output location (`cfg.adapter_dir` / `checkpoints_dir` / `merged_dir`) --
+    true for `ftspec train`, where a profile's data and its one adapter share
+    a name. It stops being true once several candidates share one corpus but
+    each need their own output tree (see ftplatform's candidate sweeps):
+    `data_dir`, when given, overrides where the corpus is read from while
+    `profile_name` still keys every output path as before.
+    """
     # Heavy imports are deferred so `--help`, config validation and CI linting
     # do not require a CUDA toolchain to be installed.
     import torch
@@ -116,7 +126,7 @@ def run(cfg: Config, profile_name: str, max_steps: int = -1,
     log.info("trainable parameters: %s / %s (%.3f%%)",
               f"{trainable:,}", f"{total:,}", 100 * trainable / total)
 
-    data_dir = cfg.data_dir(profile_name)
+    data_dir = data_dir if data_dir is not None else cfg.data_dir(profile_name)
     log.info("loading corpus from %s", data_dir)
     dataset = load_dataset("json", data_files={
         "train": str(data_dir / "train.jsonl"),

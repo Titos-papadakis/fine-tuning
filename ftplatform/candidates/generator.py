@@ -41,3 +41,31 @@ def slugify_model(base_model: str) -> str:
     ad-hoc base models not in DEFAULT_STAGE_A_CANDIDATES."""
     slug = re.sub(r"[^a-z0-9]+", "-", base_model.lower()).strip("-")
     return f"stageA-{slug}"
+
+
+# --- Stage B: LoRA sweep, training required -----------------------------
+#
+# For the Stage-A winner's base model only -- a full grid over (base model x
+# LoRA config) is not realistic on one free T4, so this narrows to one base
+# model before spending any GPU-hour on training. Each entry is a full QLoRA
+# fine-tune (ftspec.training.train.run, unmodified), run as its own process
+# for the same VRAM-isolation reason Stage A candidates are.
+
+DEFAULT_LORA_GRID: tuple[tuple[int, int], ...] = ((8, 16), (16, 16), (32, 32))
+
+
+@dataclass(frozen=True)
+class StageBCandidate:
+    candidate_id: str
+    base_model: str
+    lora_r: int
+    lora_alpha: int
+
+
+def stage_b_candidates(base_model: str,
+                         grid: tuple[tuple[int, int], ...] = DEFAULT_LORA_GRID
+                         ) -> list[StageBCandidate]:
+    """One candidate per (r, alpha) pair in `grid`, all training the same
+    `base_model` -- normally the Stage-A leaderboard's winning model."""
+    return [StageBCandidate(f"stageB-r{r}-a{alpha}", base_model, r, alpha)
+            for r, alpha in grid]

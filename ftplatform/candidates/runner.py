@@ -21,6 +21,7 @@ from ftspec.data import build
 from ftspec.data import validate as validate_mod
 from ftspec.evaluation import benchmark
 from ftspec.run import get_logger, run_manifest
+from ftspec.training import train as train_mod
 
 log = get_logger("ftplatform.candidates.runner")
 
@@ -112,6 +113,53 @@ def run_stage_a_candidate(ctx: CustomerContext, candidate, gpu_cost_per_hour: fl
         result = benchmark.run(
             profile=ctx.profile, eval_file=eval_file, results_dir=reports_dir,
             systems=candidate.systems, base_model=candidate.base_model, finetuned_model=None,
+            gpu_cost_per_hour=gpu_cost_per_hour,
+        )
+        m.metrics = result
+    return result
+
+
+def run_stage_b_candidate(ctx: CustomerContext, candidate, max_steps: int = -1,
+                            resume: bool = False, gpu_cost_per_hour: float = 0.35) -> dict:
+    """Fine-tune one Stage-B LoRA candidate, then immediately evaluate it.
+
+    `candidate` is a `ftplatform.candidates.generator.StageBCandidate`: one
+    (base_model, lora_r, lora_alpha) point in the grid built for the Stage-A
+    winner. Trains via `ftspec.training.train.run`, unmodified except for
+    its additive `data_dir` override -- the corpus stays shared across every
+    candidate while each candidate's adapter/checkpoints land in their own
+    directory (see train.py's docstring on why that split was needed).
+    """
+    data_dir = ctx.data_dir()
+    if not (data_dir / "train.jsonl").exists():
+        raise FileNotFoundError(
+            f"no training corpus for customer {ctx.customer.id!r} at {data_dir}. "
+            f"Run `ftplatform baseline run {ctx.customer.id}` first.")
+
+    cfg = ctx.config.model_copy(deep=True)
+    cfg.model.base_model = candidate.base_model
+    cfg.lora.r = candidate.lora_r
+    cfg.lora.lora_alpha = candidate.lora_alpha
+
+    key = ctx.candidate_key(candidate.candidate_id)
+    manifests_dir = ctx.manifests_dir(candidate.candidate_id)
+    fingerprint = cfg.fingerprint()
+
+    with run_manifest("train", manifests_dir / "train.json", fingerprint,
+                       params={"customer": ctx.customer.id, "candidate_id": candidate.candidate_id,
+                                "base_model": candidate.base_model, "lora_r": candidate.lora_r,
+                                "lora_alpha": candidate.lora_alpha, "max_steps": max_steps,
+                                "resume": resume}) as m:
+        m.metrics = train_mod.run(cfg, key, max_steps=max_steps, resume=resume, data_dir=data_dir)
+
+    with run_manifest("evaluate", manifests_dir / "evaluate.json", fingerprint,
+                       params={"customer": ctx.customer.id, "candidate_id": candidate.candidate_id,
+                                "systems": "finetuned"}) as m:
+        result = benchmark.run(
+            profile=ctx.profile, eval_file=data_dir / "eval.jsonl",
+            results_dir=ctx.reports_dir(candidate.candidate_id),
+            systems="finetuned", base_model=candidate.base_model,
+            finetuned_model=str(ctx.adapter_dir(candidate.candidate_id)),
             gpu_cost_per_hour=gpu_cost_per_hour,
         )
         m.metrics = result

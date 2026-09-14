@@ -94,9 +94,9 @@ def test_context_reuses_ftspec_config_path_methods(conn):
     store.create(conn, "acme", "Acme Inc", "saas_support")
     ctx = CustomerContext(conn, "acme")
 
-    assert ctx.adapter_dir("c1") == ctx.config.adapter_dir(ctx._key("c1"))
-    assert ctx.reports_dir("c1") == ctx.config.reports_dir(ctx._key("c1"))
-    assert ctx.manifests_dir("c1") == ctx.config.manifests_dir(ctx._key("c1"))
+    assert ctx.adapter_dir("c1") == ctx.config.adapter_dir(ctx.candidate_key("c1"))
+    assert ctx.reports_dir("c1") == ctx.config.reports_dir(ctx.candidate_key("c1"))
+    assert ctx.manifests_dir("c1") == ctx.config.manifests_dir(ctx.candidate_key("c1"))
 
 
 def test_db_schema_is_created_on_first_connect(tmp_path):

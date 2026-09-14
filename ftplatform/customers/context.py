@@ -59,20 +59,25 @@ class CustomerContext:
     # artefacts live at the same path shape as any other candidate's, one
     # level up from the candidates/ subtree (see the plan's directory layout).
 
-    def _key(self, candidate_id: str) -> str:
+    def candidate_key(self, candidate_id: str) -> str:
+        """The string ftspec's stage functions call `profile_name`, e.g. for
+        `ftspec.training.train.run(cfg, ctx.candidate_key(cid), ...)`. Public
+        because a few stage functions (train.run) still take this key
+        directly rather than a resolved path -- see train.py's docstring on
+        why `data_dir` had to become a separate override there."""
         return candidate_id if candidate_id == PRODUCTION else f"candidates/{candidate_id}"
 
     def candidate_dir(self, candidate_id: str) -> Path:
-        return self.config.outputs_dir(self._key(candidate_id))
+        return self.config.outputs_dir(self.candidate_key(candidate_id))
 
     def adapter_dir(self, candidate_id: str) -> Path:
-        return self.config.adapter_dir(self._key(candidate_id))
+        return self.config.adapter_dir(self.candidate_key(candidate_id))
 
     def reports_dir(self, candidate_id: str) -> Path:
-        return self.config.reports_dir(self._key(candidate_id))
+        return self.config.reports_dir(self.candidate_key(candidate_id))
 
     def manifests_dir(self, candidate_id: str) -> Path:
-        return self.config.manifests_dir(self._key(candidate_id))
+        return self.config.manifests_dir(self.candidate_key(candidate_id))
 
     def production_dir(self) -> Path:
         return self.candidate_dir(PRODUCTION)
