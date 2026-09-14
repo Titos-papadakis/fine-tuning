@@ -59,9 +59,10 @@ dev = [
 
 [project.scripts]
 ftspec = "ftspec.cli:app"
+ftplatform = "ftplatform.cli:app"
 
 [tool.setuptools.packages.find]
-include = ["ftspec*", "profiles*"]
+include = ["ftspec*", "profiles*", "ftplatform*"]
 
 [tool.ruff]
 line-length = 100

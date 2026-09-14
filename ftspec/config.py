@@ -117,6 +117,11 @@ class Config(BaseModel):
 
     # Which vertical this config targets. Overridable with --profile.
     profile: str = "saas_support"
+    # Root that outputs_dir() nests under. Default preserves the single
+    # shared outputs/<profile>/ tree; ftplatform points this at a
+    # customer-scoped path (customers/<id>/model/<workload>) so per-customer
+    # and per-candidate artefacts never collide.
+    outputs_root: str = "outputs"
     model: ModelConfig = Field(default_factory=ModelConfig)
     lora: LoraConfig = Field(default_factory=LoraConfig)
     data: DataConfig = Field(default_factory=DataConfig)
@@ -141,7 +146,7 @@ class Config(BaseModel):
         return self.resolve(self.data.dir_for(profile_name))
 
     def outputs_dir(self, profile_name: str) -> Path:
-        return self.resolve(f"outputs/{profile_name}")
+        return self.resolve(f"{self.outputs_root}/{profile_name}")
 
     def adapter_dir(self, profile_name: str) -> Path:
         return self.outputs_dir(profile_name) / self.merge.adapter_name

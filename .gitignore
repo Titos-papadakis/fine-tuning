@@ -27,3 +27,9 @@ wandb/
 
 # Local-only working material, not part of the engine.
 sales/
+
+# ftplatform per-customer state: raw customer data, model weights, and the
+# sqlite pointer store. Never shared, never committed. Anchored to the repo
+# root (leading /) so it doesn't also match the ftplatform/customers/ package.
+/customers.db
+/customers/
