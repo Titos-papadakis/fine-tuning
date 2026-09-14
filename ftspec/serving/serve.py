@@ -32,6 +32,7 @@ import json
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -116,6 +117,12 @@ class ServerState:
     # Bounded on purpose: /health reports recent behaviour, and an unbounded
     # list on a long-lived server is a slow memory leak.
     latencies_ms: deque = field(default_factory=lambda: deque(maxlen=512))
+    # Optional: (request, text, prompt_tokens, completion_tokens, elapsed_ms)
+    # -> None, called after every completed request. None by default, so
+    # serving behaviour is unchanged unless something sets it -- this is how
+    # ftplatform.monitoring.capture attaches production-traffic logging
+    # without this module knowing ftplatform exists.
+    on_response: Callable[[Any, str, int, int, float], None] | None = None
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -210,12 +217,20 @@ async def generate_once(req: ChatCompletionRequest) -> tuple[str, int, int]:
     prompt_tokens = len(final.prompt_token_ids or [])
     completion_tokens = len(final.outputs[0].token_ids or [])
 
+    elapsed_ms = (time.perf_counter() - start) * 1000
     STATE.served_requests += 1
-    STATE.latencies_ms.append((time.perf_counter() - start) * 1000)
+    STATE.latencies_ms.append(elapsed_ms)
     if constrained:
         STATE.constrained_requests += 1
     else:
         log.warning("request %s served UNCONSTRAINED at client request", request_id)
+    if STATE.on_response is not None:
+        try:
+            STATE.on_response(req, text, prompt_tokens, completion_tokens, elapsed_ms)
+        except Exception:                                             # noqa: BLE001
+            # A side-channel observer (production-traffic capture, say) must
+            # never take an actual served response down with it.
+            log.exception("on_response hook failed; the response itself was unaffected")
 
     return text, prompt_tokens, completion_tokens
 
@@ -319,6 +334,7 @@ def create_app(respect_client_system_prompt: bool = False):
             params = build_sampling_params(req, constrained)
             request_id = f"ftspec-{uuid.uuid4().hex[:12]}"
             emitted = 0
+            text = ""  # stays "" if generate() raises before its first chunk
             start = time.perf_counter()
             try:
                 async for output in STATE.engine.generate(prompt, params, request_id,
@@ -348,12 +364,21 @@ def create_app(respect_client_system_prompt: bool = False):
             # compliance alarm, raised by the very endpoint an auditor reads.
             # Latency was missing for the same reason, which excluded streaming
             # from p50/p99 precisely where latency matters most.
+            elapsed_ms = (time.perf_counter() - start) * 1000
             STATE.served_requests += 1
-            STATE.latencies_ms.append((time.perf_counter() - start) * 1000)
+            STATE.latencies_ms.append(elapsed_ms)
             if constrained:
                 STATE.constrained_requests += 1
             else:
                 log.warning("request %s served UNCONSTRAINED at client request", request_id)
+            if STATE.on_response is not None:
+                try:
+                    # Streaming never computes prompt/completion token counts
+                    # today (only generate_once's non-streaming path does) --
+                    # 0 here is an honest "not measured", not an estimate.
+                    STATE.on_response(req, text, 0, 0, elapsed_ms)
+                except Exception:                                     # noqa: BLE001
+                    log.exception("on_response hook failed; the stream itself was unaffected")
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 

@@ -41,6 +41,12 @@ app.add_typer(deploy_app, name="deploy")
 rollback_app = typer.Typer(help="Manually revert production to a prior candidate.",
                             no_args_is_help=True)
 app.add_typer(rollback_app, name="rollback")
+review_app = typer.Typer(help="Human review of flagged production traffic.",
+                          no_args_is_help=True)
+app.add_typer(review_app, name="review")
+selfimprove_app = typer.Typer(help="Fold reviewed corrections back into training.",
+                               no_args_is_help=True)
+app.add_typer(selfimprove_app, name="selfimprove")
 
 log = get_logger("ftplatform.cli")
 
@@ -482,6 +488,8 @@ def serve_customer(
     port: int = typer.Option(8000),
     max_model_len: int = typer.Option(4096),
     gpu_memory_utilization: float = typer.Option(0.90),
+    capture: bool = typer.Option(
+        True, help="Capture request/response pairs for the self-improve review queue."),
 ):
     """Serve this customer's currently-deployed production model.
 
@@ -519,8 +527,164 @@ def serve_customer(
                      fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
+    if capture:
+        from ftplatform.monitoring import capture as capture_mod
+        capture_mod.attach(ctx)
+
     serve_fn(model=model, profile=ctx.profile, lora=lora, host=host, port=port,
               max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization)
+
+
+@review_app.command("scan")
+def review_scan(customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'.")):
+    """Scan captured production traffic and queue anything worth a look."""
+    from ftplatform.monitoring import review_queue
+    from ftplatform.selfimprove.label import pending as list_pending
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    finally:
+        conn.close()
+
+    new_rows = review_queue.scan(ctx)
+    typer.echo(f"\n{len(new_rows)} new row(s) flagged for review "
+                f"({len(list_pending(ctx))} pending total)")
+
+
+@review_app.command("pending")
+def review_pending(customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'.")):
+    """List rows currently awaiting human review."""
+    from ftplatform.selfimprove.label import pending
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    finally:
+        conn.close()
+
+    rows = pending(ctx)
+    if not rows:
+        typer.echo("nothing pending")
+        return
+    for r in rows:
+        typer.echo(f"\n[{r['request_id']}] reasons={r['reasons']} "
+                    f"latency_ms={r['latency_ms']:.0f} valid={r['contract_valid']}")
+        if r.get("input"):
+            typer.echo(f"  input:  {r['input'][:200]}")
+            typer.echo(f"  output: {r['output']}")
+        else:
+            typer.echo("  (text not captured for this profile's compliance regime)")
+
+
+@review_app.command("skip")
+def review_skip(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    request_id: str = typer.Option(..., help="From `ftplatform review pending`."),
+):
+    """Confirm a flagged row was actually fine -- drop it, no correction produced."""
+    from ftplatform.selfimprove import label
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+        row = label.skip(ctx, request_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    except ValueError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+    finally:
+        conn.close()
+
+    typer.secho(f"\nskipped {row['request_id']!r} -- no correction recorded.",
+                 fg=typer.colors.GREEN)
+
+
+@review_app.command("correct")
+def review_correct(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    request_id: str = typer.Option(..., help="From `ftplatform review pending`."),
+    output: str = typer.Option(..., help="The correct output, as a JSON object."),
+):
+    """Confirm a flagged row was wrong and supply the correct output.
+
+    Appends to memory/corrections.jsonl; `ftplatform selfimprove run` folds
+    it into training.
+    """
+    import json as json_mod
+
+    from ftplatform.selfimprove import label
+
+    try:
+        corrected = json_mod.loads(output)
+    except json_mod.JSONDecodeError as e:
+        typer.secho(f"--output must be valid JSON: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+        row = label.record_correction(ctx, request_id, corrected)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    except ValueError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+    finally:
+        conn.close()
+
+    typer.secho(f"\ncorrection recorded for {row['request_id']!r}.", fg=typer.colors.GREEN)
+
+
+@selfimprove_app.command("run")
+def selfimprove_run(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    base_model: str = typer.Option(..., help="The currently-winning base model to retrain."),
+    lora_r: int = typer.Option(..., help="The currently-winning LoRA rank."),
+    lora_alpha: int = typer.Option(..., help="The currently-winning LoRA alpha."),
+    min_adherence: float = typer.Option(98.0),
+    epsilon: float = typer.Option(0.02),
+    max_steps: int = typer.Option(-1),
+    gpu_cost_per_hour: float = typer.Option(0.35),
+):
+    """Fold reviewed corrections into training, retrain, and deploy-if-better.
+
+    Does nothing (no GPU time spent) if `ftplatform review correct` has not
+    produced any corrections since the last cycle.
+    """
+    from ftplatform.selfimprove import retrain_cycle
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+        result = retrain_cycle.run_cycle(ctx, base_model, lora_r, lora_alpha, conn=conn,
+                                           min_adherence_pct=min_adherence, epsilon=epsilon,
+                                           max_steps=max_steps, gpu_cost_per_hour=gpu_cost_per_hour)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    finally:
+        conn.close()
+
+    if result["candidate_id"] is None:
+        typer.echo(f"\n{result['reason']}")
+    elif result["deployed"]:
+        typer.secho(f"\nretrained candidate {result['candidate_id']!r} "
+                     f"({result['folded']['added']} correction(s) folded) -- PROMOTED.",
+                     fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"\nretrained candidate {result['candidate_id']!r} "
+                     f"({result['folded']['added']} correction(s) folded) -- "
+                     f"NOT promoted: {result['reason']}", fg=typer.colors.YELLOW)
 
 
 if __name__ == "__main__":
