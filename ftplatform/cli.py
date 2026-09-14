@@ -35,6 +35,12 @@ app.add_typer(candidate_app, name="candidate")
 leaderboard_app = typer.Typer(help="Rank candidates that have already been run.",
                                no_args_is_help=True)
 app.add_typer(leaderboard_app, name="leaderboard")
+deploy_app = typer.Typer(help="Promote a candidate to production, with gates.",
+                          no_args_is_help=True)
+app.add_typer(deploy_app, name="deploy")
+rollback_app = typer.Typer(help="Manually revert production to a prior candidate.",
+                            no_args_is_help=True)
+app.add_typer(rollback_app, name="rollback")
 
 log = get_logger("ftplatform.cli")
 
@@ -349,6 +355,172 @@ def leaderboard_build(
                 f"(score={ranked[0]['score']})" if ranked and not ranked[0]["gated"]
                 else "\nno candidate survived the adherence floor")
     typer.echo(leaderboard.render_markdown(ranked))
+
+
+@deploy_app.command("check")
+def deploy_check(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    candidate_id: str = typer.Option(..., help="An already-run candidate to check."),
+    system: str = typer.Option("finetuned"),
+    min_adherence: float = typer.Option(98.0),
+    epsilon: float = typer.Option(0.02),
+):
+    """Show whether a candidate would pass deploy-if-better, without deploying it."""
+    from ftplatform.deployment import deploy
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    finally:
+        conn.close()
+
+    try:
+        gates = deploy.evaluate_gates(ctx, candidate_id, system, min_adherence, epsilon)
+    except (FileNotFoundError, ValueError) as e:
+        typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+
+    if gates["passed"]:
+        typer.secho(f"\n{candidate_id!r} WOULD be promoted.", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"\n{candidate_id!r} would NOT be promoted: {gates['reason']}",
+                     fg=typer.colors.YELLOW)
+
+
+@deploy_app.command("run")
+def deploy_run(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    candidate_id: str = typer.Option(..., help="An already-run candidate to promote."),
+    system: str = typer.Option("finetuned"),
+    min_adherence: float = typer.Option(98.0),
+    epsilon: float = typer.Option(0.02),
+):
+    """Promote a candidate to production/ if it clears every gate.
+
+    Failing any gate is not an error -- it means production stays exactly
+    as it was, which is the point. Use `deploy check` first to see the
+    decision without acting on it.
+    """
+    from ftplatform.deployment import deploy
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+        result = deploy.maybe_deploy(ctx, candidate_id, system, min_adherence, epsilon, conn=conn)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    except (FileNotFoundError, ValueError) as e:
+        typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+    finally:
+        conn.close()
+
+    if result["deployed"]:
+        typer.secho(f"\n{candidate_id!r} promoted to production for {customer_id!r}.",
+                     fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"\n{candidate_id!r} NOT promoted: {result['reason']}",
+                     fg=typer.colors.YELLOW)
+
+
+@deploy_app.command("history")
+def deploy_history(customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'.")):
+    """List every promotion and rollback for this customer, oldest first."""
+    from ftplatform.deployment import registry
+
+    conn = connect()
+    try:
+        rows = registry.history(conn, customer_id)
+    finally:
+        conn.close()
+
+    if not rows:
+        typer.echo("no deployments yet")
+        return
+    typer.echo(f"\n  {'deployed_at':<22} {'candidate_id':<20} rollback")
+    typer.echo("  " + "-" * 60)
+    for r in rows:
+        typer.echo(f"  {r['deployed_at']:<22} {r['candidate_id']:<20} {bool(r['is_rollback'])}")
+    typer.echo("")
+
+
+@rollback_app.command("run")
+def rollback_run(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    candidate_id: str = typer.Option(..., help="An already-run candidate to revert to."),
+    system: str = typer.Option("finetuned"),
+):
+    """Revert production/ to a previously-run candidate. Bypasses every
+    deploy-if-better gate on purpose -- see rollback.py's docstring."""
+    from ftplatform.deployment import rollback
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+        result = rollback.rollback_to(ctx, candidate_id, system, conn=conn)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    except (FileNotFoundError, ValueError) as e:
+        typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+    finally:
+        conn.close()
+
+    typer.secho(f"\nproduction reverted to {result['candidate_id']!r} for {customer_id!r}.",
+                 fg=typer.colors.GREEN)
+
+
+@app.command("serve")
+def serve_customer(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    host: str = typer.Option("0.0.0.0"),
+    port: int = typer.Option(8000),
+    max_model_len: int = typer.Option(4096),
+    gpu_memory_utilization: float = typer.Option(0.90),
+):
+    """Serve this customer's currently-deployed production model.
+
+    Prefers the merged 16-bit model if the deployed candidate's training
+    merge succeeded; falls back to base_model + LoRA adapter otherwise.
+    Nothing to serve until `deploy run` or `rollback run` has pointed
+    production/ at a candidate.
+    """
+    import json as json_mod
+
+    from ftspec.serving.serve import serve as serve_fn
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    finally:
+        conn.close()
+
+    production = ctx.production_dir()
+    merged = production / "merged_model"
+    adapter = production / "lora_adapter"
+    meta_path = production / "candidate_meta.json"
+
+    if merged.exists():
+        model, lora = str(merged), None
+    elif adapter.exists() and meta_path.exists():
+        base_model = json_mod.loads(meta_path.read_text(encoding="utf-8"))["base_model"]
+        model, lora = base_model, str(adapter)
+    else:
+        typer.secho(f"\nnothing deployed for {customer_id!r} yet -- run "
+                     f"`ftplatform deploy run {customer_id} --candidate-id ...` first.\n",
+                     fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    serve_fn(model=model, profile=ctx.profile, lora=lora, host=host, port=port,
+              max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization)
 
 
 if __name__ == "__main__":

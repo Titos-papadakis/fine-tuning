@@ -31,6 +31,20 @@ CREATE TABLE IF NOT EXISTS customers (
     status      TEXT NOT NULL DEFAULT 'active',
     created_at  TEXT NOT NULL
 );
+
+-- One row per successful promotion to production/, plus rollbacks (a
+-- rollback is itself a new row pointing at an older candidate -- history is
+-- never overwritten, only appended to, so "what was live on date X" stays
+-- answerable).
+CREATE TABLE IF NOT EXISTS deployments (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id   TEXT NOT NULL REFERENCES customers(id),
+    workload      TEXT NOT NULL,
+    candidate_id  TEXT NOT NULL,
+    deployed_at   TEXT NOT NULL,
+    is_rollback   INTEGER NOT NULL DEFAULT 0,
+    metrics_json  TEXT NOT NULL
+);
 """
 
 
