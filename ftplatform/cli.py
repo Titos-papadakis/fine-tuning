@@ -13,6 +13,7 @@ from __future__ import annotations
 import typer
 
 from ftplatform.customers import store
+from ftplatform.customers.context import CustomerContext, UnknownCustomerError
 from ftplatform.db import connect
 from ftspec.core.registry import available
 from ftspec.run import get_logger, setup_logging
@@ -25,6 +26,9 @@ app = typer.Typer(
 )
 customer_app = typer.Typer(help="Register and list customers.", no_args_is_help=True)
 app.add_typer(customer_app, name="customer")
+baseline_app = typer.Typer(help="Measure a customer's prompted-baseline systems.",
+                            no_args_is_help=True)
+app.add_typer(baseline_app, name="baseline")
 
 log = get_logger("ftplatform.cli")
 
@@ -77,6 +81,51 @@ def customer_list():
     for c in customers:
         typer.echo(f"  {c.id:<16} {c.name:<24} {c.workload:<18} {c.status:<8} {c.created_at}")
     typer.echo("")
+
+
+@baseline_app.command("run")
+def baseline_run(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    systems: str = typer.Option(
+        "base-schema,base-rubric,base-constrained",
+        help="Comma-separated systems. Defaults to local-only baselines "
+             "(no OpenAI key, no external cost)."),
+    n_train: int = typer.Option(200),
+    n_val: int = typer.Option(40),
+    n_eval: int = typer.Option(150),
+    gpu_cost_per_hour: float = typer.Option(0.35),
+):
+    """Build this customer's corpus and benchmark prompted-baseline systems.
+
+    Requires a GPU (the baseline systems still run local models) via the
+    same `train`/`serve` extras `ftspec evaluate` needs. Writes
+    memory/deployed.json: the number a later fine-tuned candidate must beat.
+    """
+    from ftplatform.candidates import runner
+
+    conn = connect()
+    try:
+        ctx = CustomerContext(conn, customer_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
+    finally:
+        conn.close()
+
+    try:
+        result = runner.run_baseline(ctx, systems=systems, n_train=n_train,
+                                       n_val=n_val, n_eval=n_eval,
+                                       gpu_cost_per_hour=gpu_cost_per_hour)
+    except (RuntimeError, ValueError) as e:
+        typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+
+    typer.echo(f"\nbaseline recorded for {customer_id!r} "
+                f"({len(result['systems'])} system(s), n_eval={result['n_eval']})")
+    for name, m in result["systems"].items():
+        typer.echo(f"  {name:<18} adherence={m['schema_adherence_pct']:.1f}%  "
+                    f"record_exact={m['record_exact_pct']:.1f}%  "
+                    f"cost/100k=${m['cost_per_100k_usd']:.2f}")
 
 
 if __name__ == "__main__":

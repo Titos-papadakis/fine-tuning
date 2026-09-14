@@ -21,12 +21,11 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from ftplatform.customers import store
+from ftplatform.customers.models import Customer
 from ftspec.config import Config
 from ftspec.core.profile import Profile
 from ftspec.core.registry import load_profile
-
-from ftplatform.customers import store
-from ftplatform.customers.models import Customer
 
 PRODUCTION = "production"
 
@@ -77,3 +76,11 @@ class CustomerContext:
 
     def production_dir(self) -> Path:
         return self.candidate_dir(PRODUCTION)
+
+    # --- tenant-level state, not tied to any one candidate -----------------
+    # Baseline/deployment bookkeeping and (from Phase 6) captured production
+    # traffic. Sits beside model/, not under it -- it outlives any single
+    # candidate.
+
+    def memory_dir(self) -> Path:
+        return self.config.resolve(f"customers/{self.customer.id}/memory")
