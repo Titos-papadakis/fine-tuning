@@ -47,6 +47,14 @@ N_TRAIN = 10000
 N_VAL = 500
 N_EVAL = 150
 EVAL_SYSTEMS = ("finetuned", "finetuned-constrained", "base-constrained", "base-rubric")
+# Kaggle GPU sessions cap out around 12h. At the default num_train_epochs=3
+# this run's own eval_loss already crashed from 1.78 -> 0.10 inside the first
+# 5% of epoch 1 -- 3 full passes over 10k examples buys little beyond that,
+# while costing ~11h of training alone. 2 epochs trades a bit of that
+# diminishing-returns tail for real headroom under the session cap.
+N_EPOCHS = 2
+EFFECTIVE_BATCH_SIZE = 8  # per_device_train_batch_size(2) x gradient_accumulation_steps(4), see config.py
+MAX_STEPS = -(-N_TRAIN // EFFECTIVE_BATCH_SIZE) * N_EPOCHS  # ceil-div, matches train.py's own step math
 
 
 def run(cmd, cwd=None, check=True):
@@ -101,7 +109,7 @@ run(["ftspec", "validate", "--profile", PROFILE], cwd=CLONE_DIR)
 
 step("4 . Train")
 started = time.time()
-run(["ftspec", "train", "--profile", PROFILE], cwd=CLONE_DIR)
+run(["ftspec", "train", "--profile", PROFILE, "--max-steps", str(MAX_STEPS)], cwd=CLONE_DIR)
 print(f"training wall clock: {(time.time() - started) / 60:.1f} min")
 
 step("5 . Benchmark matrix -- one process per system, on purpose")
