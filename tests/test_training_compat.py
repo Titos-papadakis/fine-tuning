@@ -13,6 +13,7 @@ from ftspec.training.train import (
     TRAINER_ALIASES,
     adapt_kwargs,
     detect_family,
+    scaled_steps_interval,
 )
 
 # --- stand-ins for the TRL versions we have to survive ------------------------
@@ -111,3 +112,29 @@ def test_chat_template_family_detection():
     assert detect_family("unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit") == "llama"
     assert detect_family("Qwen/Qwen2.5-7B-Instruct") == "qwen"
     assert detect_family("mistralai/Mistral-7B-v0.3") == ""     # falls back safely
+
+
+# --- eval/save interval scaling ----------------------------------------------
+# A fixed eval_steps=20 was tuned against ~75-step sanity-check runs (~4 evals).
+# Left unscaled on a 10k-example corpus (3,750 steps) it triggers ~190 full
+# validation passes, each minutes long -- the actual root cause of a Kaggle 10k
+# run that ran 10+ hours without finishing.
+
+def test_small_run_keeps_the_configured_interval_unchanged():
+    # 75 steps / target 10 evals = 7, less than the configured 20 -> unchanged.
+    assert scaled_steps_interval(20, "steps", total_steps=75) == 20
+
+
+def test_large_run_widens_the_interval_to_hit_the_eval_budget():
+    # 3,750 steps / target 10 evals = 375 evals-worth of steps between passes.
+    assert scaled_steps_interval(20, "steps", total_steps=3750) == 375
+
+
+def test_never_narrows_an_already_wide_configured_interval():
+    assert scaled_steps_interval(500, "steps", total_steps=3750) == 500
+
+
+def test_epoch_strategy_is_left_alone():
+    # Nothing to scale -- "epoch"/"no" strategies don't use a step interval.
+    assert scaled_steps_interval(20, "epoch", total_steps=3750) == 20
+    assert scaled_steps_interval(20, "no", total_steps=3750) == 20

@@ -19,6 +19,7 @@ job is an expensive place to discover a truncated sample.
 from __future__ import annotations
 
 import inspect
+import math
 from pathlib import Path
 
 from ftspec.config import Config
@@ -54,6 +55,25 @@ def detect_family(model_name: str) -> str:
 # might mean something else.
 SFT_CONFIG_ALIASES = {"max_seq_length": ("max_seq_length", "max_length")}
 TRAINER_ALIASES = {"tokenizer": ("tokenizer", "processing_class")}
+
+
+TARGET_EVALS = 10
+
+
+def scaled_steps_interval(configured: int, strategy: str, total_steps: int,
+                            target_evals: int = TARGET_EVALS) -> int:
+    """Widen a fixed `eval_steps`/`save_steps` interval for long runs.
+
+    `configured` is tuned for the small sanity-check corpora it was written
+    against (e.g. eval every 20 steps over a ~75-step run is ~4 evals, fine).
+    Left fixed, a 10k+ example corpus triggers hundreds of full validation
+    passes -- each minutes long -- dwarfing the actual training time. This
+    only ever widens the interval (fewer, not more, evals/saves than
+    configured), so short runs get exactly the configured behavior back.
+    """
+    if strategy != "steps" or target_evals <= 0:
+        return configured
+    return max(configured, total_steps // target_evals)
 
 
 def adapt_kwargs(target, kwargs: dict, aliases: dict) -> dict:
@@ -147,6 +167,17 @@ def run(cfg: Config, profile_name: str, max_steps: int = -1,
     except Exception:
         bf16 = False
 
+    if max_steps and max_steps > 0:
+        total_steps = max_steps
+    else:
+        steps_per_epoch = math.ceil(len(dataset["train"]) / t.effective_batch_size)
+        total_steps = math.ceil(steps_per_epoch * t.num_train_epochs)
+    eval_steps = scaled_steps_interval(t.eval_steps, t.eval_strategy, total_steps)
+    save_steps = scaled_steps_interval(t.save_steps, t.save_strategy, total_steps)
+    if eval_steps != t.eval_steps or save_steps != t.save_steps:
+        log.info("scaling eval_steps %d->%d, save_steps %d->%d for %d total steps",
+                  t.eval_steps, eval_steps, t.save_steps, save_steps, total_steps)
+
     sft_config = SFTConfig(**adapt_kwargs(SFTConfig, dict(
         output_dir=str(cfg.checkpoints_dir(profile_name)),
         num_train_epochs=t.num_train_epochs,
@@ -162,9 +193,9 @@ def run(cfg: Config, profile_name: str, max_steps: int = -1,
         optim=t.optim,
         logging_steps=t.logging_steps,
         eval_strategy=t.eval_strategy,
-        eval_steps=t.eval_steps,
+        eval_steps=eval_steps,
         save_strategy=t.save_strategy,
-        save_steps=t.save_steps,
+        save_steps=save_steps,
         save_total_limit=t.save_total_limit,
         seed=t.seed,
         packing=t.packing,
