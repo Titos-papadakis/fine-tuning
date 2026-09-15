@@ -123,28 +123,61 @@ run(["ftspec", "combine-eval", "--profile", PROFILE,
      "--systems", ",".join(EVAL_SYSTEMS),
      "--gpu-cost-per-hour", GPU_COST_PER_HOUR], cwd=CLONE_DIR)
 
-step("7 . Report + splice README")
-run(["ftspec", "report", "--profile", PROFILE, "--gpu-cost-per-hour", GPU_COST_PER_HOUR,
-     "--update-readme"], cwd=CLONE_DIR)
+report_path = CLONE_DIR / "outputs" / PROFILE / "reports" / "benchmark_report.md"
+if not report_path.exists():
+    # Surface this loudly in the log rather than silently continuing --
+    # a prior run on this exact pipeline finished "complete" with real
+    # eval numbers in evaluate.json but no benchmark_report.md ever reached
+    # the downloaded output, cause unconfirmed. Whatever the cause, the
+    # rest of this script (adapter collection) still has value even if the
+    # report itself is missing, so this warns rather than raises.
+    print(f"\n!!! WARNING: {report_path} does not exist right after combine-eval -- "
+          f"the report step may not have produced it. Continuing anyway so the "
+          f"adapter/manifests below still get collected.", flush=True)
+else:
+    print(f"\nconfirmed: {report_path} exists ({report_path.stat().st_size} bytes)")
 
-step("8 . Collect artifacts into /kaggle/working")
+step("7 . Collect artifacts into /kaggle/working -- BEFORE the readme-splice step below, "
+     "so a failure there can't lose what combine-eval already produced")
 out = Path("/kaggle/working/ftspec_artifacts")
 out.mkdir(exist_ok=True)
 for name in ("reports", "manifests"):
     src = CLONE_DIR / "outputs" / PROFILE / name
     if src.exists():
         shutil.copytree(src, out / name, dirs_exist_ok=True)
-readme_path = CLONE_DIR / "README.md"
-if readme_path.exists():
-    shutil.copy(readme_path, out / "README_with_results.md")
 adapter = CLONE_DIR / "outputs" / PROFILE / "lora_adapter"
 if adapter.exists():
     shutil.copytree(adapter, out / "lora_adapter", dirs_exist_ok=True)
+print("collected so far:")
+for p in sorted(out.rglob("*")):
+    if p.is_file():
+        print(" ", p.relative_to(out))
 
-readme = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
-if "<!-- BENCHMARK:BEGIN -->" in readme:
-    block = readme.split("<!-- BENCHMARK:BEGIN -->")[1].split("<!-- BENCHMARK:END -->")[0]
-    (out / "measured_results.md").write_text(block.strip() + "\n", encoding="utf-8")
+step("8 . Report + splice README (best-effort -- see step 7's note)")
+# check=False: this touches README.md and reads back the just-written report;
+# if it fails for any reason, the artifacts step 7 already collected are not
+# lost, unlike when this ran before artifact collection.
+run(["ftspec", "report", "--profile", PROFILE, "--gpu-cost-per-hour", GPU_COST_PER_HOUR,
+     "--update-readme"], cwd=CLONE_DIR, check=False)
+
+readme_path = CLONE_DIR / "README.md"
+if readme_path.exists():
+    shutil.copy(readme_path, out / "README_with_results.md")
+    readme = readme_path.read_text(encoding="utf-8")
+    if "<!-- BENCHMARK:BEGIN -->" in readme:
+        block = readme.split("<!-- BENCHMARK:BEGIN -->")[1].split("<!-- BENCHMARK:END -->")[0]
+        (out / "measured_results.md").write_text(block.strip() + "\n", encoding="utf-8")
+
+step("9 . Strip bulk that isn't worth downloading, before Kaggle snapshots /kaggle/working")
+# .git (a full clone, not needed once the code is installed), intermediate
+# training checkpoints (full optimizer state per checkpoint -- only the
+# final lora_adapter/ matters once training succeeded), and the HF download
+# cache under merged_model/ all inflate this run's output for no benefit,
+# and are the leading suspect for why reports/ didn't make it into the
+# previous sanity-check run's download.
+shutil.rmtree(CLONE_DIR / ".git", ignore_errors=True)
+shutil.rmtree(CLONE_DIR / "outputs" / PROFILE / "checkpoints", ignore_errors=True)
+shutil.rmtree(CLONE_DIR / "outputs" / PROFILE / "merged_model" / ".cache", ignore_errors=True)
 
 print("\nDONE -- artifacts in", out)
 for p in sorted(out.rglob("*")):
