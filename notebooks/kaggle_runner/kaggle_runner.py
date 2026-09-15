@@ -1,10 +1,22 @@
 """
-Headless Kaggle equivalent of notebooks/colab_runner.ipynb.
+Headless Kaggle equivalent of notebooks/colab_runner.ipynb -- now building
+the stronger generic baseline (not a per-customer run): a bigger synthetic
+corpus than the 200/40/150 defaults, plus grammar-constrained decoding
+evaluated on the finetuned adapter itself (not just the untrained base
+model). This is the first two steps of the original 4-point accuracy plan
+(scale the data, turn on constrained decoding); real per-field error
+analysis is already free from `render_report()`'s existing "Per-field
+accuracy" table -- no new tooling needed, just reading its output after this
+runs. A base-model swap (8B -> something larger) is deliberately left out of
+this run: it's the riskiest, most VRAM-constrained lever, and only worth
+spending T4 time on once we've seen whether the cheaper two moves are
+already enough.
 
-Runs the ftspec saas_support pipeline end to end (prepare -> audit -> validate
--> train -> evaluate x3 -> combine-eval -> report) as a plain script instead
-of notebook cells, so it can execute unattended on Kaggle's free GPU quota
-via `kaggle kernels push` instead of a human clicking through Colab cells.
+Runs the ftspec saas_support pipeline end to end (prepare -> audit ->
+validate -> train -> evaluate x4 -> combine-eval -> report) as a plain
+script instead of notebook cells, so it can execute unattended on Kaggle's
+free GPU quota via `kaggle kernels push` instead of a human clicking through
+Colab cells.
 
 Kaggle kernels write to /kaggle/working, which becomes the kernel's
 downloadable output -- everything worth keeping is copied there at the end
@@ -20,6 +32,14 @@ REPO = "https://github.com/Titos-papadakis/fine-tuning.git"
 CLONE_DIR = Path("/kaggle/working/ftspec")
 PROFILE = "saas_support"
 GPU_COST_PER_HOUR = "0.35"
+# 7.5x the 200-example default. n_eval is left at the original 150 on
+# purpose -- that's what the 36.7% Record Exact Match baseline being chased
+# here was measured on, so this run's eval stays directly comparable to it
+# rather than moving both the training data and the measuring stick at once.
+N_TRAIN = 1500
+N_VAL = 150
+N_EVAL = 150
+EVAL_SYSTEMS = ("finetuned", "finetuned-constrained", "base-constrained", "base-rubric")
 
 
 def run(cmd, cwd=None, check=True):
@@ -67,7 +87,8 @@ print("environment OK")
 
 step("3 . Build and gate the corpus")
 run(["ftspec", "profiles"], cwd=CLONE_DIR)
-run(["ftspec", "prepare", "--profile", PROFILE], cwd=CLONE_DIR)
+run(["ftspec", "prepare", "--profile", PROFILE,
+     "--n-train", str(N_TRAIN), "--n-val", str(N_VAL), "--n-eval", str(N_EVAL)], cwd=CLONE_DIR)
 run(["ftspec", "audit", "--profile", PROFILE], cwd=CLONE_DIR)
 run(["ftspec", "validate", "--profile", PROFILE], cwd=CLONE_DIR)
 
@@ -82,13 +103,17 @@ step("5 . Benchmark matrix -- one process per system, on purpose")
 # per system sidesteps it entirely (same reasoning as colab_runner.ipynb).
 # check=False: if one system OOMs, combine-eval below still reports on
 # whichever systems did succeed instead of losing the whole run.
-for systems in ("finetuned", "base-constrained", "base-rubric"):
+# finetuned-constrained re-evaluates the same trained adapter with
+# grammar-constrained decoding on -- a separate catalogue entry from
+# "finetuned" (see ftspec/evaluation/benchmark.py) so both show up as their
+# own columns/McNemar comparison in one combined report.
+for systems in EVAL_SYSTEMS:
     run(["ftspec", "evaluate", "--profile", PROFILE, "--systems", systems,
          "--gpu-cost-per-hour", GPU_COST_PER_HOUR], cwd=CLONE_DIR, check=False)
 
 step("6 . Combine the per-system runs into one matrix")
 run(["ftspec", "combine-eval", "--profile", PROFILE,
-     "--systems", "finetuned,base-constrained,base-rubric",
+     "--systems", ",".join(EVAL_SYSTEMS),
      "--gpu-cost-per-hour", GPU_COST_PER_HOUR], cwd=CLONE_DIR)
 
 step("7 . Report + splice README")

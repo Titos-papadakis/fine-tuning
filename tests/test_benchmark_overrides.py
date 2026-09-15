@@ -85,6 +85,46 @@ def test_constrained_override_can_turn_it_off_for_base_constrained(monkeypatch, 
     assert captured[0].constrained is False
 
 
+def test_finetuned_constrained_is_constrained_by_default(monkeypatch, eval_file, tmp_path):
+    captured = []
+    monkeypatch.setattr(B, "run_local", _capturing_run_local(captured))
+
+    B.run(PROFILE, eval_file, tmp_path, systems="finetuned-constrained",
+          finetuned_model="unused/path")
+
+    assert captured[0].constrained is True  # catalogue default, no override needed
+
+
+def test_finetuned_constrained_gets_finetuned_model_not_base_model(monkeypatch, eval_file, tmp_path):
+    """The bug this guards: run()'s model assignment used to key off the
+    literal string `name == "finetuned"`, so a second finetuned-family
+    system would have silently been evaluated against `base_model` instead
+    of the trained adapter."""
+    captured = []
+    monkeypatch.setattr(B, "run_local", _capturing_run_local(captured))
+
+    B.run(PROFILE, eval_file, tmp_path, systems="finetuned-constrained",
+          base_model="should/not/be/used", finetuned_model="the/trained/adapter")
+
+    assert captured[0].model == "the/trained/adapter"
+
+
+def test_finetuned_and_finetuned_constrained_can_run_together_as_separate_systems(
+        monkeypatch, eval_file, tmp_path):
+    captured = []
+    monkeypatch.setattr(B, "run_local", _capturing_run_local(captured))
+
+    result = B.run(PROFILE, eval_file, tmp_path, systems="finetuned,finetuned-constrained",
+                    finetuned_model="the/trained/adapter")
+
+    assert {s.name for s in captured} == {"finetuned", "finetuned-constrained"}
+    assert captured[0].constrained is False and captured[1].constrained is True
+    assert all(s.model == "the/trained/adapter" for s in captured)
+    assert set(result["systems"]) == {"finetuned", "finetuned-constrained"}
+    assert (tmp_path / "raw_finetuned.jsonl").exists()
+    assert (tmp_path / "raw_finetuned-constrained.jsonl").exists()
+
+
 def test_overrides_never_touch_hosted_systems(monkeypatch, eval_file, tmp_path):
     """load_in_4bit/constrained are inference-engine concepts; a hosted
     OpenAI system has no such knobs and must be refused/skipped exactly as

@@ -1,5 +1,5 @@
 {
-  "id": "KAGGLE_USERNAME/ftspec-saas-support-runner",
+  "id": "titospapadak/ftspec-saas-support-runner",
   "title": "ftspec saas_support end-to-end runner",
   "code_file": "kaggle_runner.py",
   "language": "python",

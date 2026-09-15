@@ -62,6 +62,11 @@ class SystemSpec:
     prompt_variant: str     # "short" | "schema" | "schema+rubric"
     constrained: bool = False
     load_in_4bit: bool = True  # False = fp16 inference, for the quantization-vs-quality tradeoff
+    # True for every "finetuned"-family entry (the trained adapter, under any
+    # decoding toggle) -- run()'s model assignment keys off this rather than
+    # `name == "finetuned"` so a second finetuned variant (e.g.
+    # finetuned-constrained) also gets `finetuned_model`, not `base_model`.
+    is_finetuned: bool = False
 
     @property
     def is_hosted(self) -> bool:
@@ -74,7 +79,14 @@ def system_catalogue() -> dict:
         "base-rubric": SystemSpec("base-rubric", "local", "", "schema+rubric"),
         "base-constrained": SystemSpec("base-constrained", "local", "", "schema+rubric",
                                         constrained=True),
-        "finetuned": SystemSpec("finetuned", "local", "", "short"),
+        "finetuned": SystemSpec("finetuned", "local", "", "short", is_finetuned=True),
+        # Same trained adapter as "finetuned", grammar-constrained decoding on
+        # -- a separate catalogue entry (not just an evaluate --constrained
+        # flag) so both can appear as their own columns in the same combined
+        # report/McNemar comparison, instead of one overwriting the other's
+        # raw_finetuned.jsonl.
+        "finetuned-constrained": SystemSpec("finetuned-constrained", "local", "", "short",
+                                             constrained=True, is_finetuned=True),
         "gpt4o-schema": SystemSpec("gpt4o-schema", "openai", "gpt-4o", "schema"),
         "gpt4o-rubric": SystemSpec("gpt4o-rubric", "openai", "gpt-4o", "schema+rubric"),
         "gpt4o-mini-rubric": SystemSpec("gpt4o-mini-rubric", "openai", "gpt-4o-mini",
@@ -490,7 +502,7 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
 
     for name in requested:
         spec = catalogue[name]
-        spec.model = finetuned_model if name == "finetuned" else (
+        spec.model = finetuned_model if spec.is_finetuned else (
             base_model if spec.backend == "local" else spec.model)
         if spec.backend == "local":
             spec.load_in_4bit = load_in_4bit
