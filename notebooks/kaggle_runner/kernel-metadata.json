@@ -1,6 +1,6 @@
 {
-  "id": "titospapadak/ftspec-saas-support-runner",
-  "title": "ftspec saas_support end-to-end runner",
+  "id": "titospapadak/ftspec-saas-support-end-to-end-runner",
+  "title": "ftspec saas support end to end runner",
   "code_file": "kaggle_runner.py",
   "language": "python",
   "kernel_type": "script",
