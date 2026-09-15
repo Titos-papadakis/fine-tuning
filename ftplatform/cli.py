@@ -961,6 +961,7 @@ def serve_shared(
     max_model_len: int = typer.Option(4096),
     gpu_memory_utilization: float = typer.Option(0.90),
     max_lora_rank: int = typer.Option(16),
+    cache_size: int = typer.Option(0, help="Exact-match response cache size (0 disables it)."),
 ):
     """Serve every customer on `workload` with a production deployment from
     ONE shared vLLM engine -- one base model's weights loaded once, each
@@ -1005,7 +1006,7 @@ def serve_shared(
     profile = load_profile(workload)
     ftspec_serve(base_model, profile, lora=lora, host=host, port=port,
                  max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization,
-                 max_lora_rank=max_lora_rank)
+                 max_lora_rank=max_lora_rank, cache_size=cache_size)
 
 
 if __name__ == "__main__":

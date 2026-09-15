@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import types
+from collections import OrderedDict
 
 import pytest
 
@@ -79,6 +80,10 @@ def client(monkeypatch):
     S.STATE.lora_requests = {}
     S.STATE.served_requests = 0
     S.STATE.constrained_requests = 0
+    S.STATE.cache_max_size = 0
+    S.STATE.cache = OrderedDict()
+    S.STATE.cache_hits = 0
+    S.STATE.cache_misses = 0
 
     # SamplingParams lives in vLLM, which is not installed in CI. Record the
     # arguments instead so the schema-enforcement assertions still hold.
@@ -221,6 +226,10 @@ def multi_lora_client(monkeypatch):
     S.STATE.lora_requests = {"acme": object(), "globex": object()}
     S.STATE.served_requests = 0
     S.STATE.constrained_requests = 0
+    S.STATE.cache_max_size = 0
+    S.STATE.cache = OrderedDict()
+    S.STATE.cache_hits = 0
+    S.STATE.cache_misses = 0
 
     monkeypatch.setattr(S, "build_sampling_params",
                          lambda req, constrained: {"constrained": constrained,
@@ -280,6 +289,103 @@ def test_single_adapter_mode_health_reports_no_lora_models_list(client):
     c, _, _ = client
     body = c.get("/health").json()
     assert body["lora_models"] is None
+
+
+# --- exact-match caching ------------------------------------------------------
+
+@pytest.fixture
+def cached_client(monkeypatch):
+    engine = StubEngine()
+    tokenizer = StubTokenizer()
+
+    S.STATE.engine = engine
+    S.STATE.tokenizer = tokenizer
+    S.STATE.profile = PROFILE
+    S.STATE.schema = PROFILE.contract.json_schema()
+    S.STATE.system_prompt = PROMPT_SHORT
+    S.STATE.model_name = f"ftspec-{PROFILE.name}"
+    S.STATE.lora_request = None
+    S.STATE.lora_requests = {}
+    S.STATE.served_requests = 0
+    S.STATE.constrained_requests = 0
+    S.STATE.cache_max_size = 2
+    S.STATE.cache = OrderedDict()
+    S.STATE.cache_hits = 0
+    S.STATE.cache_misses = 0
+
+    monkeypatch.setattr(S, "build_sampling_params",
+                         lambda req, constrained: {"constrained": constrained,
+                                                     "max_tokens": req.max_tokens})
+
+    app = S.create_app(respect_client_system_prompt=False)
+    with TestClient(app) as c:
+        yield c, engine
+
+
+def test_cache_disabled_by_default_never_short_circuits_the_engine(client):
+    """Cache is opt-in (cache_max_size=0 by default) -- an identical repeat
+    request must still reach the engine every time unless enabled."""
+    c, engine, _ = client
+    post(c)
+    post(c)
+    assert len(engine.calls) == 2
+
+
+def test_cache_hit_on_an_identical_repeat_request_skips_the_engine(cached_client):
+    c, engine = cached_client
+    post(c)
+    post(c)
+    assert len(engine.calls) == 1  # second call served from cache
+
+
+def test_cache_hit_returns_the_same_content_as_the_original(cached_client):
+    c, _ = cached_client
+    first = post(c).json()["choices"][0]["message"]["content"]
+    second = post(c).json()["choices"][0]["message"]["content"]
+    assert first == second == SAMPLE_OUTPUT
+
+
+def test_cache_miss_on_different_message_content(cached_client):
+    c, engine = cached_client
+    post(c, messages=[{"role": "user", "content": "Customer: I was charged twice."}])
+    post(c, messages=[{"role": "user", "content": "Customer: totally different issue."}])
+    assert len(engine.calls) == 2
+
+
+def test_nonzero_temperature_is_never_cached(cached_client):
+    """Caching a nonzero-temperature request would silently make sampling
+    deterministic -- see _cache_key()."""
+    c, engine = cached_client
+    post(c, temperature=0.7)
+    post(c, temperature=0.7)
+    assert len(engine.calls) == 2
+
+
+def test_cache_stats_are_reported_on_stats_and_health(cached_client):
+    c, _ = cached_client
+    post(c)
+    post(c)
+    stats = c.get("/stats").json()
+    assert stats["cache_hits"] == 1
+    assert stats["cache_misses"] == 1
+    health = c.get("/health").json()
+    assert health["cache"]["enabled"] is True
+    assert health["cache"]["hits"] == 1
+    assert health["cache"]["misses"] == 1
+
+
+def test_cache_evicts_least_recently_used_past_max_size(cached_client):
+    """cache_max_size=2 in this fixture -- a third distinct request must
+    evict the first, not the second."""
+    c, engine = cached_client
+    post(c, messages=[{"role": "user", "content": "one"}])
+    post(c, messages=[{"role": "user", "content": "two"}])
+    post(c, messages=[{"role": "user", "content": "three"}])
+    assert len(engine.calls) == 3
+    assert len(S.STATE.cache) == 2
+
+    post(c, messages=[{"role": "user", "content": "one"}])  # evicted -> re-generates
+    assert len(engine.calls) == 4
 
 
 # --- streaming ---------------------------------------------------------------

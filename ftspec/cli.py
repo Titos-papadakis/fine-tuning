@@ -453,6 +453,40 @@ def infer(
         raise typer.Exit(code=1)
 
 
+@app.command("infer-batch")
+def infer_batch(
+    input_file: Path = typer.Option(..., "--input", help="One document per line -- a raw "
+                                     "string, {'input': ...}, or an existing "
+                                     "train/eval.jsonl's {'messages': [...]} rows."),
+    output_file: Path = typer.Option(..., "--output", help="Where to write results, one "
+                                      "{'input', 'output', 'valid'} JSON object per line."),
+    model: str = typer.Option(..., help="Base model, or a merged model directory (no --lora)."),
+    profile: str | None = ProfileOpt,
+    schema: Path | None = SchemaOpt,
+    config: Path | None = ConfigOpt,
+    lora: str | None = typer.Option(None, help="LoRA adapter to load on top of --model."),
+    batch_size: int = typer.Option(8, help="Documents generated together per forward pass."),
+    max_new_tokens: int = typer.Option(512),
+    load_in_4bit: bool = typer.Option(True),
+):
+    """Bulk-extract many documents at once, for throughput on a backlog --
+    not for latency measurement (see infer, evaluate for that). Unconstrained:
+    validated against the contract afterward, not guaranteed by construction
+    the way `infer`'s grammar strategy is -- see batch.py's module docstring
+    for why constrained decoding isn't batched.
+    """
+    from ftspec.inference.batch import run_batch
+
+    _, prof, _, _ = _resolve(config, profile, schema)
+
+    summary = run_batch(model, lora, prof, input_file, output_file, batch_size=batch_size,
+                          max_new_tokens=max_new_tokens, load_in_4bit=load_in_4bit)
+
+    typer.echo(f"\n{summary['n_valid']}/{summary['n_processed']} valid, "
+                f"{summary['elapsed_s']}s ({summary['docs_per_s']} docs/s)")
+    typer.secho(f"written -> {summary['output_path']}", fg=typer.colors.GREEN)
+
+
 # --- serve -------------------------------------------------------------------
 
 @app.command()
@@ -469,6 +503,9 @@ def serve(
     max_lora_rank: int = typer.Option(16),
     respect_client_system_prompt: bool = typer.Option(
         False, help="Honour client system prompts instead of injecting the trained one."),
+    cache_size: int = typer.Option(
+        0, help="Exact-match response cache size (0 disables it). Only temperature=0 "
+                "requests are cacheable -- see serve.py's _cache_key()."),
 ):
     """Serve an OpenAI-compatible endpoint with the profile's schema enforced server-side."""
     from ftspec.serving.serve import serve as serve_fn
@@ -477,7 +514,7 @@ def serve(
     serve_fn(model=model, profile=prof, lora=lora, host=host, port=port,
               max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization,
               max_lora_rank=max_lora_rank,
-              respect_client_system_prompt=respect_client_system_prompt)
+              respect_client_system_prompt=respect_client_system_prompt, cache_size=cache_size)
 
 
 # --- schema ------------------------------------------------------------------

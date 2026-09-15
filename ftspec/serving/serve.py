@@ -28,10 +28,11 @@ Run:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -129,6 +130,18 @@ class ServerState:
     # ftplatform.monitoring.capture attaches production-traffic logging
     # without this module knowing ftplatform exists.
     on_response: Callable[[Any, str, int, int, float], None] | None = None
+    # Exact-match cache for non-streaming, temperature=0 requests (see
+    # _cache_key() -- a request at any other temperature is never cached,
+    # since caching would silently make sampling deterministic). 0 (the
+    # default) disables caching entirely -- generate_once() never even
+    # computes a key, so behaviour is unchanged unless a caller opts in via
+    # serve()/load_engine()'s `cache_size`. LRU by insertion/access order,
+    # bounded by cache_max_size so a long-lived server's memory can't grow
+    # unbounded from cached response text.
+    cache_max_size: int = 0
+    cache: OrderedDict = field(default_factory=OrderedDict)
+    cache_hits: int = 0
+    cache_misses: int = 0
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -206,6 +219,44 @@ def _select_lora_request(req: ChatCompletionRequest):
     return lora_request
 
 
+def _cache_key(req: ChatCompletionRequest) -> str | None:
+    """None means "don't cache this request" -- only temperature=0 (the
+    server's own default) is exact-match cacheable; caching a nonzero-
+    temperature request would silently turn sampling deterministic, which
+    is not what a caller asking for temperature>0 wants. Includes every
+    field that affects the output (model/adapter, messages, decoding
+    params, constrained on/off), so two requests only collide when they
+    would genuinely produce the same result."""
+    if req.temperature != 0.0:
+        return None
+    payload = json.dumps({
+        "model": req.model,
+        "messages": [m.model_dump() for m in req.messages],
+        "top_p": req.top_p,
+        "max_tokens": req.max_tokens,
+        "constrained": not req.ftspec_unconstrained,
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _record_response(req: ChatCompletionRequest, text: str, prompt_tokens: int,
+                      completion_tokens: int, elapsed_ms: float, constrained: bool,
+                      request_id: str) -> None:
+    STATE.served_requests += 1
+    STATE.latencies_ms.append(elapsed_ms)
+    if constrained:
+        STATE.constrained_requests += 1
+    else:
+        log.warning("request %s served UNCONSTRAINED at client request", request_id)
+    if STATE.on_response is not None:
+        try:
+            STATE.on_response(req, text, prompt_tokens, completion_tokens, elapsed_ms)
+        except Exception:                                             # noqa: BLE001
+            # A side-channel observer (production-traffic capture, say) must
+            # never take an actual served response down with it.
+            log.exception("on_response hook failed; the response itself was unaffected")
+
+
 def render_prompt(messages: list) -> str:
     """Apply the chat template, injecting the trained system prompt.
 
@@ -230,10 +281,22 @@ def render_prompt(messages: list) -> str:
 
 async def generate_once(req: ChatCompletionRequest) -> tuple[str, int, int]:
     lora_request = _select_lora_request(req)  # raises UnknownModelError before any generation
-    prompt = render_prompt(req.messages)
     constrained = not req.ftspec_unconstrained
-    params = build_sampling_params(req, constrained)
     request_id = f"ftspec-{uuid.uuid4().hex[:12]}"
+    cache_key = _cache_key(req) if STATE.cache_max_size > 0 else None
+
+    if cache_key is not None and cache_key in STATE.cache:
+        STATE.cache_hits += 1
+        STATE.cache.move_to_end(cache_key)
+        text, prompt_tokens, completion_tokens = STATE.cache[cache_key]
+        _record_response(req, text, prompt_tokens, completion_tokens, 0.0, constrained,
+                          request_id)
+        return text, prompt_tokens, completion_tokens
+    if cache_key is not None:
+        STATE.cache_misses += 1
+
+    prompt = render_prompt(req.messages)
+    params = build_sampling_params(req, constrained)
     start = time.perf_counter()
 
     final = None
@@ -247,22 +310,16 @@ async def generate_once(req: ChatCompletionRequest) -> tuple[str, int, int]:
     text = final.outputs[0].text
     prompt_tokens = len(final.prompt_token_ids or [])
     completion_tokens = len(final.outputs[0].token_ids or [])
-
     elapsed_ms = (time.perf_counter() - start) * 1000
-    STATE.served_requests += 1
-    STATE.latencies_ms.append(elapsed_ms)
-    if constrained:
-        STATE.constrained_requests += 1
-    else:
-        log.warning("request %s served UNCONSTRAINED at client request", request_id)
-    if STATE.on_response is not None:
-        try:
-            STATE.on_response(req, text, prompt_tokens, completion_tokens, elapsed_ms)
-        except Exception:                                             # noqa: BLE001
-            # A side-channel observer (production-traffic capture, say) must
-            # never take an actual served response down with it.
-            log.exception("on_response hook failed; the response itself was unaffected")
 
+    if cache_key is not None:
+        STATE.cache[cache_key] = (text, prompt_tokens, completion_tokens)
+        STATE.cache.move_to_end(cache_key)
+        while len(STATE.cache) > STATE.cache_max_size:
+            STATE.cache.popitem(last=False)  # evict least-recently-used
+
+    _record_response(req, text, prompt_tokens, completion_tokens, elapsed_ms, constrained,
+                      request_id)
     return text, prompt_tokens, completion_tokens
 
 
@@ -297,6 +354,9 @@ def create_app(respect_client_system_prompt: bool = False):
                 "schema_fields": sorted(STATE.schema.get("properties", {})),
                 "lora": STATE.lora_request is not None or bool(STATE.lora_requests),
                 "lora_models": sorted(STATE.lora_requests) if STATE.lora_requests else None,
+                "cache": {"enabled": STATE.cache_max_size > 0, "size": len(STATE.cache),
+                           "max_size": STATE.cache_max_size, "hits": STATE.cache_hits,
+                           "misses": STATE.cache_misses},
                 "uptime_s": round(time.time() - STATE.started_at, 1),
                 "latency_ms": {"count": len(recent),
                                 "p50": _percentile(recent, 50),
@@ -337,7 +397,8 @@ def create_app(respect_client_system_prompt: bool = False):
     async def stats():
         return {"served_requests": STATE.served_requests,
                 "constrained_requests": STATE.constrained_requests,
-                "unconstrained_requests": STATE.served_requests - STATE.constrained_requests}
+                "unconstrained_requests": STATE.served_requests - STATE.constrained_requests,
+                "cache_hits": STATE.cache_hits, "cache_misses": STATE.cache_misses}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
@@ -438,7 +499,8 @@ def create_app(respect_client_system_prompt: bool = False):
 
 
 def load_engine(model: str, profile: Profile, lora: str | dict[str, str] | None,
-                 max_model_len: int, gpu_memory_utilization: float, max_lora_rank: int) -> None:
+                 max_model_len: int, gpu_memory_utilization: float, max_lora_rank: int,
+                 cache_size: int = 0) -> None:
     """`lora`:
       - None: base model only, no adapter.
       - str: single adapter path, served to every request -- unchanged
@@ -448,10 +510,19 @@ def load_engine(model: str, profile: Profile, lora: str | dict[str, str] | None,
         All adapters must be compatible with `max_lora_rank` and the same
         base model/profile -- this is the "one workload, many customers on
         one GPU" case, not a way to mix different verticals.
+
+    `cache_size`: 0 (default) disables the exact-match response cache;
+    >0 enables it, evicting least-recently-used entries past that many
+    entries. See _cache_key() for exactly what's cached (temperature=0
+    requests only) and why.
     """
     from transformers import AutoTokenizer
     from vllm import AsyncEngineArgs, AsyncLLMEngine
 
+    STATE.cache_max_size = cache_size
+    STATE.cache = OrderedDict()
+    STATE.cache_hits = 0
+    STATE.cache_misses = 0
     STATE.profile = profile
     STATE.schema = profile.contract.json_schema()
     STATE.system_prompt = profile.prompts.short
@@ -497,10 +568,11 @@ def load_engine(model: str, profile: Profile, lora: str | dict[str, str] | None,
 def serve(model: str, profile: Profile, lora: str | dict[str, str] | None = None,
            host: str = "0.0.0.0", port: int = 8000, max_model_len: int = 4096,
            gpu_memory_utilization: float = 0.90, max_lora_rank: int = 16,
-           respect_client_system_prompt: bool = False) -> None:
+           respect_client_system_prompt: bool = False, cache_size: int = 0) -> None:
     import uvicorn
 
-    load_engine(model, profile, lora, max_model_len, gpu_memory_utilization, max_lora_rank)
+    load_engine(model, profile, lora, max_model_len, gpu_memory_utilization, max_lora_rank,
+                cache_size)
     app = create_app(respect_client_system_prompt)
 
     log.info("listening on http://%s:%d/v1/chat/completions", host, port)
