@@ -33,3 +33,8 @@ sales/
 # root (leading /) so it doesn't also match the ftplatform/customers/ package.
 /customers.db
 /customers/
+
+# Local staging for ftplatform.remote (Kaggle job packets/output) -- same
+# sensitivity as /customers/ above, since a packet carries one customer's
+# data.
+/.kaggle_work/

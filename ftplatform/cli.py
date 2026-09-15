@@ -49,6 +49,9 @@ selfimprove_app = typer.Typer(help="Fold reviewed corrections back into training
 app.add_typer(selfimprove_app, name="selfimprove")
 job_app = typer.Typer(help="The automation job queue.", no_args_is_help=True)
 app.add_typer(job_app, name="job")
+kaggle_app = typer.Typer(help="Run a queued job on Kaggle's free GPU instead of locally.",
+                          no_args_is_help=True)
+app.add_typer(kaggle_app, name="kaggle")
 
 log = get_logger("ftplatform.cli")
 
@@ -810,6 +813,57 @@ def job_requeue_stale(
     finally:
         conn.close()
     typer.echo(f"\n{len(stale_ids)} stale job(s) marked failed: {stale_ids}")
+
+
+@kaggle_app.command("start")
+def kaggle_start(
+    job_id: str = typer.Argument(..., help="A job id from `job enqueue`/`job list`."),
+    customer_id: str = typer.Argument(..., help="Customer id the job belongs to."),
+    owner: str = typer.Option(..., help="Your Kaggle username."),
+):
+    """Export a pending job, upload it as a private Kaggle dataset, and push
+    the kernel that runs it. Does not wait -- run `kaggle poll` afterwards
+    (repeatedly, until it reports something other than 'still running')."""
+    from ftplatform.remote.run_on_kaggle import default_work_dir, start_job_on_kaggle
+
+    conn = connect()
+    try:
+        result = start_job_on_kaggle(conn, customer_id, job_id, owner,
+                                      default_work_dir(job_id))
+    finally:
+        conn.close()
+    typer.secho(f"\npushed kernel {result['kernel_id']!r} for job {job_id!r}.",
+                fg=typer.colors.GREEN)
+    typer.echo(f"  dataset: {result['dataset_id']}")
+    typer.echo(f"  check progress with: ftplatform kaggle poll {job_id} {customer_id} "
+               f"--owner {owner}")
+
+
+@kaggle_app.command("poll")
+def kaggle_poll(
+    job_id: str = typer.Argument(..., help="The job id passed to `kaggle start`."),
+    customer_id: str = typer.Argument(..., help="Customer id the job belongs to."),
+    owner: str = typer.Option(..., help="Your Kaggle username."),
+):
+    """Check a Kaggle run's status once. If it's finished, download and
+    merge the result back into customers.db and customers/<id>/; otherwise
+    report that it's still running so you can call this again later."""
+    from ftplatform.remote.run_on_kaggle import default_work_dir, kernel_id_for, poll_and_finish_job
+
+    conn = connect()
+    try:
+        job = poll_and_finish_job(conn, customer_id, job_id,
+                                   kernel_id_for(job_id, owner), default_work_dir(job_id))
+    finally:
+        conn.close()
+
+    if job is None:
+        typer.echo("still running -- check again later")
+        return
+    color = typer.colors.GREEN if job["status"] == "done" else typer.colors.RED
+    typer.secho(f"\njob {job['id']!r} ({job['kind']}) -> {job['status']}", fg=color)
+    if job["status"] == "failed":
+        typer.echo(f"  {job['result']['error']}")
 
 
 if __name__ == "__main__":
