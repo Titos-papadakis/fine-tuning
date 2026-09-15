@@ -102,6 +102,12 @@ class ServerState:
     profile: Profile | None = None
     model_name: str = "ftspec-extractor"
     lora_request: Any = None
+    # Multi-tenant serving: several customers' LoRA adapters registered
+    # against one shared base model, keyed by the name a caller picks via
+    # the request's `model` field (see _select_lora_request()). Empty dict
+    # (the default) means single-adapter mode -- lora_request above is used
+    # for every request exactly as before; this is purely additive.
+    lora_requests: dict = field(default_factory=dict)
     respect_client_system_prompt: bool = False
     schema: dict = field(default_factory=dict)
     system_prompt: str = ""
@@ -176,6 +182,30 @@ def build_sampling_params(req: ChatCompletionRequest, constrained: bool):
         ) from e
 
 
+class UnknownModelError(Exception):
+    pass
+
+
+def _select_lora_request(req: ChatCompletionRequest):
+    """Which adapter serves this request.
+
+    Single-adapter mode (STATE.lora_requests empty, the default): every
+    request uses STATE.lora_request, unchanged from before multi-tenant
+    serving existed. Multi-adapter mode: req.model must name one of the
+    registered adapters -- picked explicitly by the caller, the same way an
+    OpenAI client selects a fine-tuned model id, rather than guessed from
+    anything else about the request. An unrecognized name is refused, never
+    silently served by the wrong customer's adapter or the base model.
+    """
+    if not STATE.lora_requests:
+        return STATE.lora_request
+    lora_request = STATE.lora_requests.get(req.model)
+    if lora_request is None:
+        raise UnknownModelError(
+            f"unknown model {req.model!r}. Available: {sorted(STATE.lora_requests)}")
+    return lora_request
+
+
 def render_prompt(messages: list) -> str:
     """Apply the chat template, injecting the trained system prompt.
 
@@ -199,6 +229,7 @@ def render_prompt(messages: list) -> str:
 
 
 async def generate_once(req: ChatCompletionRequest) -> tuple[str, int, int]:
+    lora_request = _select_lora_request(req)  # raises UnknownModelError before any generation
     prompt = render_prompt(req.messages)
     constrained = not req.ftspec_unconstrained
     params = build_sampling_params(req, constrained)
@@ -207,7 +238,7 @@ async def generate_once(req: ChatCompletionRequest) -> tuple[str, int, int]:
 
     final = None
     async for output in STATE.engine.generate(prompt, params, request_id,
-                                               lora_request=STATE.lora_request):
+                                               lora_request=lora_request):
         final = output
 
     if final is None or not final.outputs:
@@ -264,7 +295,8 @@ def create_app(respect_client_system_prompt: bool = False):
                                         if profile else None,
                 "schema_enforced": True,
                 "schema_fields": sorted(STATE.schema.get("properties", {})),
-                "lora": STATE.lora_request is not None,
+                "lora": STATE.lora_request is not None or bool(STATE.lora_requests),
+                "lora_models": sorted(STATE.lora_requests) if STATE.lora_requests else None,
                 "uptime_s": round(time.time() - STATE.started_at, 1),
                 "latency_ms": {"count": len(recent),
                                 "p50": _percentile(recent, 50),
@@ -277,9 +309,17 @@ def create_app(respect_client_system_prompt: bool = False):
 
     @app.get("/v1/models")
     async def list_models():
+        # In multi-adapter mode, each registered name is itself a valid
+        # `model` value for /v1/chat/completions -- listing them is how a
+        # caller discovers which one to pass, the same way OpenAI's
+        # /v1/models lists fine-tuned model ids.
+        if STATE.lora_requests:
+            ids = sorted(STATE.lora_requests)
+        else:
+            ids = [STATE.model_name]
         return {"object": "list",
-                "data": [{"id": STATE.model_name, "object": "model",
-                           "created": int(time.time()), "owned_by": "ftspec"}]}
+                "data": [{"id": i, "object": "model",
+                           "created": int(time.time()), "owned_by": "ftspec"} for i in ids]}
 
     @app.get("/v1/schema")
     async def schema():
@@ -312,6 +352,8 @@ def create_app(respect_client_system_prompt: bool = False):
         if not req.stream:
             try:
                 text, p_tok, c_tok = await generate_once(req)
+            except UnknownModelError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
             except Exception as e:
                 log.exception("generation failed")
                 raise HTTPException(status_code=500, detail=str(e)) from e
@@ -321,6 +363,16 @@ def create_app(respect_client_system_prompt: bool = False):
                 usage=Usage(prompt_tokens=p_tok, completion_tokens=c_tok,
                              total_tokens=p_tok + c_tok),
             )
+
+        # Resolved before the stream starts (rather than inside event_stream())
+        # so an unknown model name is a clean 400, not a stream that opens and
+        # then errors mid-way -- the response's headers are already committed
+        # once StreamingResponse starts, so this is the last point a normal
+        # HTTP status code is still possible.
+        try:
+            lora_request = _select_lora_request(req)
+        except UnknownModelError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
         async def event_stream():
             first = {"id": completion_id, "object": "chat.completion.chunk",
@@ -338,7 +390,7 @@ def create_app(respect_client_system_prompt: bool = False):
             start = time.perf_counter()
             try:
                 async for output in STATE.engine.generate(prompt, params, request_id,
-                                                           lora_request=STATE.lora_request):
+                                                           lora_request=lora_request):
                     text = output.outputs[0].text
                     if len(text) > emitted:
                         delta = text[emitted:]
@@ -385,8 +437,18 @@ def create_app(respect_client_system_prompt: bool = False):
     return app
 
 
-def load_engine(model: str, profile: Profile, lora: str | None, max_model_len: int,
-                 gpu_memory_utilization: float, max_lora_rank: int) -> None:
+def load_engine(model: str, profile: Profile, lora: str | dict[str, str] | None,
+                 max_model_len: int, gpu_memory_utilization: float, max_lora_rank: int) -> None:
+    """`lora`:
+      - None: base model only, no adapter.
+      - str: single adapter path, served to every request -- unchanged
+        behavior from before multi-tenant serving existed.
+      - dict[name, path]: several adapters sharing this one base model and
+        engine, selected per request by name (see _select_lora_request()).
+        All adapters must be compatible with `max_lora_rank` and the same
+        base model/profile -- this is the "one workload, many customers on
+        one GPU" case, not a way to mix different verticals.
+    """
     from transformers import AutoTokenizer
     from vllm import AsyncEngineArgs, AsyncLLMEngine
 
@@ -405,10 +467,21 @@ def load_engine(model: str, profile: Profile, lora: str | None, max_model_len: i
         enable_lora=lora is not None,
         max_lora_rank=max_lora_rank if lora else 16,
     )
-    log.info("starting vLLM engine (lora=%s)", lora or "none")
+    log.info("starting vLLM engine (lora=%s)",
+              "none" if lora is None else f"{len(lora)} adapters" if isinstance(lora, dict)
+              else lora)
     STATE.engine = AsyncLLMEngine.from_engine_args(engine_args)
 
-    if lora:
+    if isinstance(lora, dict):
+        from vllm.lora.request import LoRARequest
+        # vLLM requires a unique positive int id per adapter; assigned
+        # deterministically from sorted name order so the same customer set
+        # always gets the same ids across restarts (matters for any vLLM
+        # internal caching keyed on lora_int_id, not just for us).
+        for i, (name, path) in enumerate(sorted(lora.items()), start=1):
+            STATE.lora_requests[name] = LoRARequest(name, i, path)
+            log.info("registered LoRA adapter %r (id=%d) from %s", name, i, path)
+    elif lora:
         from vllm.lora.request import LoRARequest
         STATE.lora_request = LoRARequest("ftspec-adapter", 1, lora)
         log.info("serving LoRA adapter from %s", lora)
@@ -421,7 +494,7 @@ def load_engine(model: str, profile: Profile, lora: str | None, max_model_len: i
                   "only admissible deployment for its data")
 
 
-def serve(model: str, profile: Profile, lora: str | None = None,
+def serve(model: str, profile: Profile, lora: str | dict[str, str] | None = None,
            host: str = "0.0.0.0", port: int = 8000, max_model_len: int = 4096,
            gpu_memory_utilization: float = 0.90, max_lora_rank: int = 16,
            respect_client_system_prompt: bool = False) -> None:

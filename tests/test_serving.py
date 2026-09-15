@@ -76,6 +76,7 @@ def client(monkeypatch):
     S.STATE.system_prompt = PROMPT_SHORT
     S.STATE.model_name = f"ftspec-{PROFILE.name}"
     S.STATE.lora_request = None
+    S.STATE.lora_requests = {}
     S.STATE.served_requests = 0
     S.STATE.constrained_requests = 0
 
@@ -199,6 +200,86 @@ def test_client_system_prompt_is_honoured_when_configured(monkeypatch):
             "messages": [{"role": "system", "content": "You are a pirate."},
                           {"role": "user", "content": "Customer: hello"}]})
     assert S.STATE.tokenizer.last_conversation[0]["content"] == "You are a pirate."
+
+
+# --- multi-tenant LoRA serving ------------------------------------------------
+
+@pytest.fixture
+def multi_lora_client(monkeypatch):
+    """Two customers' adapters registered on one shared engine -- everything
+    else identical to `client` above."""
+    engine = StubEngine()
+    tokenizer = StubTokenizer()
+
+    S.STATE.engine = engine
+    S.STATE.tokenizer = tokenizer
+    S.STATE.profile = PROFILE
+    S.STATE.schema = PROFILE.contract.json_schema()
+    S.STATE.system_prompt = PROMPT_SHORT
+    S.STATE.model_name = f"ftspec-{PROFILE.name}"
+    S.STATE.lora_request = None
+    S.STATE.lora_requests = {"acme": object(), "globex": object()}
+    S.STATE.served_requests = 0
+    S.STATE.constrained_requests = 0
+
+    monkeypatch.setattr(S, "build_sampling_params",
+                         lambda req, constrained: {"constrained": constrained,
+                                                     "max_tokens": req.max_tokens})
+
+    app = S.create_app(respect_client_system_prompt=False)
+    with TestClient(app) as c:
+        yield c, engine
+
+
+def test_multi_lora_request_uses_the_named_customers_adapter(multi_lora_client):
+    c, engine = multi_lora_client
+    r = post(c, model="acme")
+    assert r.status_code == 200
+    assert engine.calls[0]["lora"] is S.STATE.lora_requests["acme"]
+
+
+def test_multi_lora_two_customers_get_their_own_adapter(multi_lora_client):
+    c, engine = multi_lora_client
+    post(c, model="acme")
+    post(c, model="globex")
+    assert engine.calls[0]["lora"] is S.STATE.lora_requests["acme"]
+    assert engine.calls[1]["lora"] is S.STATE.lora_requests["globex"]
+
+
+def test_multi_lora_unknown_model_is_refused_not_silently_served(multi_lora_client):
+    c, engine = multi_lora_client
+    r = post(c, model="does-not-exist")
+    assert r.status_code == 400
+    assert "does-not-exist" in r.json()["detail"]
+    assert engine.calls == []  # never reached generation
+
+
+def test_multi_lora_unknown_model_refused_before_streaming_starts(multi_lora_client):
+    c, engine = multi_lora_client
+    r = c.post("/v1/chat/completions", json={
+        "model": "does-not-exist", "stream": True,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+    assert engine.calls == []
+
+
+def test_multi_lora_models_endpoint_lists_every_registered_customer(multi_lora_client):
+    c, _ = multi_lora_client
+    body = c.get("/v1/models").json()
+    assert {d["id"] for d in body["data"]} == {"acme", "globex"}
+
+
+def test_multi_lora_health_reports_registered_names(multi_lora_client):
+    c, _ = multi_lora_client
+    body = c.get("/health").json()
+    assert body["lora"] is True
+    assert body["lora_models"] == ["acme", "globex"]
+
+
+def test_single_adapter_mode_health_reports_no_lora_models_list(client):
+    c, _, _ = client
+    body = c.get("/health").json()
+    assert body["lora_models"] is None
 
 
 # --- streaming ---------------------------------------------------------------

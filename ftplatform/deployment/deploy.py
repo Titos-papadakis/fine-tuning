@@ -114,7 +114,7 @@ def evaluate_gates(ctx, new_candidate_id: str, new_system: str = "finetuned",
     return {"passed": True, "reason": None, "new": new_row, "current": current_rows}
 
 
-def _infer_base_model(ctx, candidate_id: str) -> str | None:
+def infer_base_model(ctx, candidate_id: str) -> str | None:
     """Looks up which base model a candidate was built from, from whatever
     manifest that candidate already has -- train.json for a Stage-B
     candidate, evaluate.json's own base_model for Stage A, or (Stage C,
@@ -129,7 +129,7 @@ def _infer_base_model(ctx, candidate_id: str) -> str | None:
             return params["base_model"]
         winner = params.get("winner_candidate_id")
         if winner and winner != candidate_id:
-            return _infer_base_model(ctx, winner)
+            return infer_base_model(ctx, winner)
     return None
 
 
@@ -140,7 +140,7 @@ def _promote(ctx, candidate_id: str, row: CandidateRow, conn=None, is_rollback: 
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
 
-    base_model = _infer_base_model(ctx, candidate_id)
+    base_model = infer_base_model(ctx, candidate_id)
     if base_model:
         (dst / "candidate_meta.json").write_text(
             json.dumps({"base_model": base_model, "candidate_id": candidate_id},

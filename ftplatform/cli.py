@@ -953,5 +953,60 @@ def learning_summary(
     typer.echo("")
 
 
+@app.command("serve-shared")
+def serve_shared(
+    workload: str = typer.Argument(..., help="e.g. 'saas_support'."),
+    host: str = typer.Option("0.0.0.0"),
+    port: int = typer.Option(8000),
+    max_model_len: int = typer.Option(4096),
+    gpu_memory_utilization: float = typer.Option(0.90),
+    max_lora_rank: int = typer.Option(16),
+):
+    """Serve every customer on `workload` with a production deployment from
+    ONE shared vLLM engine -- one base model's weights loaded once, each
+    customer's LoRA adapter hot-swapped in per request (see
+    ftplatform/serving/shared_server.py) -- instead of one process per
+    customer.
+
+    Customers whose production adapter was trained from a different base
+    model than the majority are excluded and named in the output; a request
+    picks its adapter by passing the customer id as the OpenAI `model`
+    field.
+    """
+    from ftplatform.serving.shared_server import discover_production_adapters, group_by_base_model
+    from ftspec.core.registry import load_profile
+    from ftspec.serving.serve import serve as ftspec_serve
+
+    conn = connect()
+    try:
+        adapters = discover_production_adapters(conn, workload)
+    finally:
+        conn.close()
+
+    if not adapters:
+        typer.secho(f"no customer on workload {workload!r} has a production deployment yet",
+                     fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    groups = group_by_base_model(adapters)
+    if not groups:
+        typer.secho("no customer's base model could be determined -- nothing to serve",
+                     fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    base_model, lora = max(groups.items(), key=lambda kv: len(kv[1]))
+    excluded = set(adapters) - set(lora)
+    typer.echo(f"\nserving {len(lora)} customer(s) on base model {base_model!r}: "
+                f"{sorted(lora)}")
+    if excluded:
+        typer.secho(f"excluded (different base model, run again on a separate instance "
+                     f"for these): {sorted(excluded)}", fg=typer.colors.YELLOW)
+
+    profile = load_profile(workload)
+    ftspec_serve(base_model, profile, lora=lora, host=host, port=port,
+                 max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization,
+                 max_lora_rank=max_lora_rank)
+
+
 if __name__ == "__main__":
     app()

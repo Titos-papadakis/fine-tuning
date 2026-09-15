@@ -192,7 +192,7 @@ def test_infer_base_model_resolves_through_a_stage_c_winner_reference(customer_c
     _write_candidate(customer_ctx, "stageC-fp16-constrained", "finetuned", _metrics(),
                       params={"winner_candidate_id": "stageB-r16-a16"})
 
-    assert deploy._infer_base_model(customer_ctx, "stageC-fp16-constrained") == "org/winner-model"
+    assert deploy.infer_base_model(customer_ctx, "stageC-fp16-constrained") == "org/winner-model"
 
 
 # --- rollback ------------------------------------------------------------------
