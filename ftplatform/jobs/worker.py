@@ -48,7 +48,8 @@ def _dispatch(conn, ctx: CustomerContext, kind: str, payload: dict):
 
     if kind == "leaderboard":
         from ftplatform.candidates.leaderboard import build
-        return {"ranked": build(ctx, payload["candidates"], **payload.get("kwargs", {}))}
+        return {"ranked": build(ctx, payload["candidates"], conn=conn,
+                                 **payload.get("kwargs", {}))}
 
     if kind == "deploy":
         from ftplatform.deployment.deploy import maybe_deploy

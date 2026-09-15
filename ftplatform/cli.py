@@ -52,6 +52,10 @@ app.add_typer(job_app, name="job")
 kaggle_app = typer.Typer(help="Run a queued job on Kaggle's free GPU instead of locally.",
                           no_args_is_help=True)
 app.add_typer(kaggle_app, name="kaggle")
+learning_app = typer.Typer(
+    help="Cross-customer technique stats (scores/configs only, never customer data).",
+    no_args_is_help=True)
+app.add_typer(learning_app, name="learning")
 
 log = get_logger("ftplatform.cli")
 
@@ -152,14 +156,32 @@ def baseline_run(
 
 
 @candidate_app.command("list-presets")
-def candidate_list_presets():
+def candidate_list_presets(
+    workload: str | None = typer.Option(
+        None, help="Reorder by historical mean score for this workload, if any prior "
+                   "customer has run Stage A for it (see `ftplatform learning summary`). "
+                   "Every preset is still shown -- this only changes the order."),
+):
     """List the built-in Stage-A candidate base models."""
     from ftplatform.candidates.generator import DEFAULT_STAGE_A_CANDIDATES
 
-    typer.echo(f"\n  {'candidate_id':<20} {'label':<16} base_model")
-    typer.echo("  " + "-" * 80)
-    for c in DEFAULT_STAGE_A_CANDIDATES:
-        typer.echo(f"  {c.candidate_id:<20} {c.label:<16} {c.base_model}")
+    candidates = DEFAULT_STAGE_A_CANDIDATES
+    scores: dict[str, float] = {}
+    if workload:
+        from ftplatform.learning import stats
+        conn = connect()
+        try:
+            candidates = stats.reorder_by_history(conn, workload, "stage_a",
+                                                   candidates, key=lambda c: c.candidate_id)
+            scores = stats.mean_scores(conn, workload, "stage_a")
+        finally:
+            conn.close()
+
+    typer.echo(f"\n  {'candidate_id':<20} {'label':<16} {'hist. score':>11}  base_model")
+    typer.echo("  " + "-" * 92)
+    for c in candidates:
+        score = f"{scores[c.candidate_id]:.3f}" if c.candidate_id in scores else "-"
+        typer.echo(f"  {c.candidate_id:<20} {c.label:<16} {score:>11}  {c.base_model}")
     typer.echo("")
 
 
@@ -258,13 +280,30 @@ def candidate_stage_b(
 
 
 @candidate_app.command("lora-grid")
-def candidate_lora_grid():
+def candidate_lora_grid(
+    workload: str | None = typer.Option(
+        None, help="Reorder by historical mean score for this workload, if any prior "
+                   "customer has run Stage B for it. Every grid point is still shown."),
+):
     """Show the default Stage-B LoRA (r, alpha) grid."""
-    from ftplatform.candidates.generator import DEFAULT_LORA_GRID
+    from ftplatform.candidates.generator import DEFAULT_LORA_GRID, stage_b_candidate_id
 
-    typer.echo(f"\n  {'r':>4} {'alpha':>6}")
-    for r, alpha in DEFAULT_LORA_GRID:
-        typer.echo(f"  {r:>4} {alpha:>6}")
+    grid = DEFAULT_LORA_GRID
+    scores: dict[str, float] = {}
+    if workload:
+        from ftplatform.learning import stats
+        conn = connect()
+        try:
+            grid = stats.reorder_by_history(conn, workload, "stage_b", grid,
+                                             key=lambda pair: stage_b_candidate_id(*pair))
+            scores = stats.mean_scores(conn, workload, "stage_b")
+        finally:
+            conn.close()
+
+    typer.echo(f"\n  {'r':>4} {'alpha':>6}  {'hist. score':>11}")
+    for r, alpha in grid:
+        score = scores.get(stage_b_candidate_id(r, alpha))
+        typer.echo(f"  {r:>4} {alpha:>6}  {f'{score:.3f}' if score is not None else '-':>11}")
     typer.echo("")
 
 
@@ -320,13 +359,31 @@ def candidate_stage_c(
 
 
 @candidate_app.command("stage-c-combos")
-def candidate_stage_c_combos():
+def candidate_stage_c_combos(
+    workload: str | None = typer.Option(
+        None, help="Reorder by historical mean score for this workload, if any prior "
+                   "customer has run Stage C for it. Every combo is still shown."),
+):
     """Show the default Stage-C quantization/constrained-decoding combos."""
-    from ftplatform.candidates.generator import DEFAULT_STAGE_C_COMBOS
+    from ftplatform.candidates.generator import DEFAULT_STAGE_C_COMBOS, stage_c_candidate_id
 
-    typer.echo(f"\n  {'quantization':<14} constrained")
-    for q, c in DEFAULT_STAGE_C_COMBOS:
-        typer.echo(f"  {q:<14} {c}")
+    combos = DEFAULT_STAGE_C_COMBOS
+    scores: dict[str, float] = {}
+    if workload:
+        from ftplatform.learning import stats
+        conn = connect()
+        try:
+            combos = stats.reorder_by_history(
+                conn, workload, "stage_c", combos,
+                key=lambda combo: stage_c_candidate_id("stageC", *combo))
+            scores = stats.mean_scores(conn, workload, "stage_c")
+        finally:
+            conn.close()
+
+    typer.echo(f"\n  {'quantization':<14} {'constrained':<12} {'hist. score':>11}")
+    for q, c in combos:
+        score = scores.get(stage_c_candidate_id("stageC", q, c))
+        typer.echo(f"  {q:<14} {str(c):<12} {f'{score:.3f}' if score is not None else '-':>11}")
     typer.echo("")
 
 
@@ -348,19 +405,20 @@ def leaderboard_build(
 
     conn = connect()
     try:
-        ctx = CustomerContext(conn, customer_id)
-    except UnknownCustomerError as e:
-        typer.secho(str(e), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from e
+        try:
+            ctx = CustomerContext(conn, customer_id)
+        except UnknownCustomerError as e:
+            typer.secho(str(e), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from e
+
+        ids = {c.strip(): c.strip() for c in candidates.split(",") if c.strip()}
+        try:
+            ranked = leaderboard.build(ctx, ids, conn=conn, min_adherence_pct=min_adherence)
+        except FileNotFoundError as e:
+            typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from e
     finally:
         conn.close()
-
-    ids = {c.strip(): c.strip() for c in candidates.split(",") if c.strip()}
-    try:
-        ranked = leaderboard.build(ctx, ids, min_adherence_pct=min_adherence)
-    except FileNotFoundError as e:
-        typer.secho(f"\n{e}\n", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from e
 
     typer.echo(f"\ntop candidate: {ranked[0]['label']} / {ranked[0]['system']} "
                 f"(score={ranked[0]['score']})" if ranked and not ranked[0]["gated"]
@@ -864,6 +922,35 @@ def kaggle_poll(
     typer.secho(f"\njob {job['id']!r} ({job['kind']}) -> {job['status']}", fg=color)
     if job["status"] == "failed":
         typer.echo(f"  {job['result']['error']}")
+
+
+@learning_app.command("summary")
+def learning_summary(
+    workload: str = typer.Argument(..., help="e.g. 'saas_support'."),
+):
+    """How each technique has scored so far across every customer on this
+    workload. Never shows customer data -- only candidate_id (a technique
+    descriptor, e.g. 'stageB-r16-a16') and the same composite score the
+    leaderboard computes. See `ftplatform/learning/` for what is and isn't
+    shared across customers."""
+    from ftplatform.learning import stats
+
+    conn = connect()
+    try:
+        rows = stats.summary(conn, workload)
+    finally:
+        conn.close()
+
+    if not rows:
+        typer.echo(f"no leaderboard has been built yet for workload {workload!r}")
+        return
+    typer.echo(f"\n  {'stage':<10} {'candidate_id':<20} {'runs':>5} {'mean score':>11} {'gated':>6}")
+    typer.echo("  " + "-" * 60)
+    for r in rows:
+        mean_score = f"{r['mean_score']:.3f}" if r["mean_score"] is not None else "-"
+        typer.echo(f"  {r['stage']:<10} {r['candidate_id']:<20} {r['n']:>5} "
+                    f"{mean_score:>11} {r['gated_count']:>6}")
+    typer.echo("")
 
 
 if __name__ == "__main__":

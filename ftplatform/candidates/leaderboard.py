@@ -36,9 +36,15 @@ def load_candidate_systems(ctx, candidate_id: str, label: str = "") -> list[Cand
     ]
 
 
-def build(ctx, candidates: dict[str, str], **rank_kwargs) -> list[dict]:
+def build(ctx, candidates: dict[str, str], conn=None, **rank_kwargs) -> list[dict]:
     """`candidates`: {candidate_id: label}. Ranks every system from every
-    candidate together and writes benchmark/leaderboard.{json,md}."""
+    candidate together and writes benchmark/leaderboard.{json,md}.
+
+    `conn`, when given, also records this leaderboard into the cross-customer
+    `candidate_stats` table (see ftplatform/learning/) -- optional and
+    additive, default None preserves the exact prior behavior for any caller
+    that doesn't pass one.
+    """
     rows: list[CandidateRow] = []
     for candidate_id, label in candidates.items():
         rows.extend(load_candidate_systems(ctx, candidate_id, label))
@@ -51,6 +57,11 @@ def build(ctx, candidates: dict[str, str], **rank_kwargs) -> list[dict]:
         json.dumps(ranked, indent=2, ensure_ascii=False), encoding="utf-8")
     (out_dir / "leaderboard.md").write_text(render_markdown(ranked), encoding="utf-8")
     log.info("leaderboard written -> %s", out_dir / "leaderboard.md")
+
+    if conn is not None:
+        from ftplatform.learning import stats
+        stats.record(conn, ctx.customer.workload, ctx.customer.id, ranked)
+
     return ranked
 
 

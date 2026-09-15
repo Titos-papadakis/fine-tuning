@@ -67,6 +67,26 @@ CREATE TABLE IF NOT EXISTS approvals (
     customer_id   TEXT PRIMARY KEY REFERENCES customers(id),
     approved_at   TEXT NOT NULL
 );
+
+-- Phase 8 -- cross-customer learning, deliberately narrow: one row per
+-- (candidate, system) every time a leaderboard is built for any customer.
+-- candidate_id already *is* a technique descriptor by construction (see
+-- candidates/generator.py: "stageA-qwen25-3b", "stageB-r16-a16", ...), so
+-- this table never carries a customer's actual data, corpus, or model
+-- weights -- only which technique was tried, for which workload, and the
+-- same composite score the leaderboard itself already computed.
+-- customer_id is kept for audit traceability only. See ftplatform/learning/.
+CREATE TABLE IF NOT EXISTS candidate_stats (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    workload      TEXT NOT NULL,
+    stage         TEXT NOT NULL,
+    candidate_id  TEXT NOT NULL,
+    system        TEXT NOT NULL,
+    score         REAL,
+    gated         INTEGER NOT NULL DEFAULT 0,
+    customer_id   TEXT NOT NULL REFERENCES customers(id),
+    recorded_at   TEXT NOT NULL
+);
 """
 
 

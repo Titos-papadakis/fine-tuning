@@ -62,12 +62,19 @@ class StageBCandidate:
     lora_alpha: int
 
 
+def stage_b_candidate_id(r: int, alpha: int) -> str:
+    """Split out from stage_b_candidates() so ftplatform/learning/stats.py
+    can compute the same id from a raw (r, alpha) pair -- e.g. from
+    DEFAULT_LORA_GRID -- without duplicating the format string."""
+    return f"stageB-r{r}-a{alpha}"
+
+
 def stage_b_candidates(base_model: str,
                          grid: tuple[tuple[int, int], ...] = DEFAULT_LORA_GRID
                          ) -> list[StageBCandidate]:
     """One candidate per (r, alpha) pair in `grid`, all training the same
     `base_model` -- normally the Stage-A leaderboard's winning model."""
-    return [StageBCandidate(f"stageB-r{r}-a{alpha}", base_model, r, alpha)
+    return [StageBCandidate(stage_b_candidate_id(r, alpha), base_model, r, alpha)
             for r, alpha in grid]
 
 
@@ -95,8 +102,13 @@ class StageCCandidate:
         return self.quantization == "4bit"
 
 
+def stage_c_candidate_id(prefix: str, quantization: str, constrained: bool) -> str:
+    """Split out from stage_c_candidates() for the same reason as
+    stage_b_candidate_id() above."""
+    return f"{prefix}-{quantization}-{'constrained' if constrained else 'unconstrained'}"
+
+
 def stage_c_candidates(prefix: str = "stageC",
                          combos: tuple[tuple[str, bool], ...] = DEFAULT_STAGE_C_COMBOS
                          ) -> list[StageCCandidate]:
-    return [StageCCandidate(f"{prefix}-{q}-{'constrained' if c else 'unconstrained'}", q, c)
-            for q, c in combos]
+    return [StageCCandidate(stage_c_candidate_id(prefix, q, c), q, c) for q, c in combos]
