@@ -84,6 +84,9 @@ def client(monkeypatch):
     S.STATE.cache = OrderedDict()
     S.STATE.cache_hits = 0
     S.STATE.cache_misses = 0
+    S.STATE.api_key_resolver = None
+    S.STATE.rate_limit_per_min = 0
+    S.STATE.rate_window = {}
 
     # SamplingParams lives in vLLM, which is not installed in CI. Record the
     # arguments instead so the schema-enforcement assertions still hold.
@@ -230,6 +233,9 @@ def multi_lora_client(monkeypatch):
     S.STATE.cache = OrderedDict()
     S.STATE.cache_hits = 0
     S.STATE.cache_misses = 0
+    S.STATE.api_key_resolver = None
+    S.STATE.rate_limit_per_min = 0
+    S.STATE.rate_window = {}
 
     monkeypatch.setattr(S, "build_sampling_params",
                          lambda req, constrained: {"constrained": constrained,
@@ -312,6 +318,9 @@ def cached_client(monkeypatch):
     S.STATE.cache = OrderedDict()
     S.STATE.cache_hits = 0
     S.STATE.cache_misses = 0
+    S.STATE.api_key_resolver = None
+    S.STATE.rate_limit_per_min = 0
+    S.STATE.rate_window = {}
 
     monkeypatch.setattr(S, "build_sampling_params",
                          lambda req, constrained: {"constrained": constrained,
@@ -386,6 +395,209 @@ def test_cache_evicts_least_recently_used_past_max_size(cached_client):
 
     post(c, messages=[{"role": "user", "content": "one"}])  # evicted -> re-generates
     assert len(engine.calls) == 4
+
+
+# --- auth + rate limiting -----------------------------------------------------
+
+@pytest.fixture
+def auth_client(monkeypatch):
+    """Single-adapter mode, auth required."""
+    engine = StubEngine()
+    tokenizer = StubTokenizer()
+
+    S.STATE.engine = engine
+    S.STATE.tokenizer = tokenizer
+    S.STATE.profile = PROFILE
+    S.STATE.schema = PROFILE.contract.json_schema()
+    S.STATE.system_prompt = PROMPT_SHORT
+    S.STATE.model_name = f"ftspec-{PROFILE.name}"
+    S.STATE.lora_request = None
+    S.STATE.lora_requests = {}
+    S.STATE.served_requests = 0
+    S.STATE.constrained_requests = 0
+    S.STATE.cache_max_size = 0
+    S.STATE.cache = OrderedDict()
+    S.STATE.cache_hits = 0
+    S.STATE.cache_misses = 0
+    S.STATE.api_key_resolver = {"key-a": "acme"}.get
+    S.STATE.rate_limit_per_min = 0
+    S.STATE.rate_window = {}
+
+    monkeypatch.setattr(S, "build_sampling_params",
+                         lambda req, constrained: {"constrained": constrained,
+                                                     "max_tokens": req.max_tokens})
+
+    app = S.create_app(respect_client_system_prompt=False)
+    with TestClient(app) as c:
+        yield c, engine
+
+
+@pytest.fixture
+def auth_multi_lora_client(monkeypatch):
+    """Multi-adapter mode, auth required -- the realistic shared-server
+    scenario: two customers' adapters, two customers' keys."""
+    engine = StubEngine()
+    tokenizer = StubTokenizer()
+
+    S.STATE.engine = engine
+    S.STATE.tokenizer = tokenizer
+    S.STATE.profile = PROFILE
+    S.STATE.schema = PROFILE.contract.json_schema()
+    S.STATE.system_prompt = PROMPT_SHORT
+    S.STATE.model_name = f"ftspec-{PROFILE.name}"
+    S.STATE.lora_request = None
+    S.STATE.lora_requests = {"acme": object(), "globex": object()}
+    S.STATE.served_requests = 0
+    S.STATE.constrained_requests = 0
+    S.STATE.cache_max_size = 10
+    S.STATE.cache = OrderedDict()
+    S.STATE.cache_hits = 0
+    S.STATE.cache_misses = 0
+    S.STATE.api_key_resolver = {"key-a": "acme", "key-b": "globex"}.get
+    S.STATE.rate_limit_per_min = 0
+    S.STATE.rate_window = {}
+
+    monkeypatch.setattr(S, "build_sampling_params",
+                         lambda req, constrained: {"constrained": constrained,
+                                                     "max_tokens": req.max_tokens})
+
+    app = S.create_app(respect_client_system_prompt=False)
+    with TestClient(app) as c:
+        yield c, engine
+
+
+def _auth_post(client, key=None, **overrides):
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    body = {"model": f"ftspec-{PROFILE.name}",
+             "messages": [{"role": "user", "content": "Customer: I was charged twice."}]}
+    body.update(overrides)
+    return client.post("/v1/chat/completions", json=body, headers=headers)
+
+
+def test_missing_authorization_header_is_401_when_auth_required(auth_client):
+    c, engine = auth_client
+    r = _auth_post(c)
+    assert r.status_code == 401
+    assert engine.calls == []
+
+
+def test_invalid_key_is_401(auth_client):
+    c, engine = auth_client
+    r = _auth_post(c, key="not-a-real-key")
+    assert r.status_code == 401
+    assert engine.calls == []
+
+
+def test_valid_key_is_served(auth_client):
+    c, engine = auth_client
+    r = _auth_post(c, key="key-a")
+    assert r.status_code == 200
+    assert len(engine.calls) == 1
+
+
+def test_no_auth_required_by_default(client):
+    """The existing default-mode fixture never sets api_key_resolver --
+    requests with no Authorization header at all must still work."""
+    c, engine, _ = client
+    assert post(c).status_code == 200
+    assert len(engine.calls) == 1
+
+
+def test_streaming_also_requires_auth(auth_client):
+    c, engine = auth_client
+    r = c.post("/v1/chat/completions", json={
+        "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 401
+    assert engine.calls == []
+
+
+def test_health_reports_auth_required(auth_client):
+    c, _ = auth_client
+    assert c.get("/health").json()["auth_required"] is True
+
+
+# --- auth in multi-adapter mode: the actual isolation guarantee --------------
+
+def test_authenticated_customer_gets_their_own_adapter_regardless_of_model_field(
+        auth_multi_lora_client):
+    """The point of tying adapter selection to auth: even if a client sends
+    a *different* customer's id as `model`, the authenticated key still
+    wins -- there is no way to read another customer's adapter by lying
+    about `model`."""
+    c, engine = auth_multi_lora_client
+    r = _auth_post(c, key="key-a", model="globex")  # acme's key, claiming to be globex
+    assert r.status_code == 200
+    assert engine.calls[0]["lora"] is S.STATE.lora_requests["acme"]
+
+
+def test_two_customers_each_get_their_own_adapter(auth_multi_lora_client):
+    c, engine = auth_multi_lora_client
+    _auth_post(c, key="key-a")
+    _auth_post(c, key="key-b")
+    assert engine.calls[0]["lora"] is S.STATE.lora_requests["acme"]
+    assert engine.calls[1]["lora"] is S.STATE.lora_requests["globex"]
+
+
+def test_cache_does_not_leak_between_customers_with_identical_requests(auth_multi_lora_client):
+    """The bug this guards: caching solely on req.model (client-supplied)
+    would let two customers who send the same `model` value share a cache
+    entry. Keying on the auth-resolved customer_id instead prevents it."""
+    c, engine = auth_multi_lora_client
+    _auth_post(c, key="key-a", model="same-value-both-send")
+    _auth_post(c, key="key-b", model="same-value-both-send")
+    assert len(engine.calls) == 2  # no cache hit across customers
+    assert engine.calls[0]["lora"] is S.STATE.lora_requests["acme"]
+    assert engine.calls[1]["lora"] is S.STATE.lora_requests["globex"]
+
+
+def test_on_response_receives_the_resolved_customer_id(auth_client, monkeypatch):
+    c, _ = auth_client
+    received = []
+    S.STATE.on_response = lambda req, text, p, comp, ms, customer_id: received.append(customer_id)
+    _auth_post(c, key="key-a")
+    assert received == ["acme"]
+    S.STATE.on_response = None
+
+
+# --- rate limiting -----------------------------------------------------------
+
+def test_rate_limit_allows_requests_under_the_cap(auth_client):
+    c, engine = auth_client
+    S.STATE.rate_limit_per_min = 3
+    for _ in range(3):
+        assert _auth_post(c, key="key-a").status_code == 200
+    assert len(engine.calls) == 3
+
+
+def test_rate_limit_rejects_the_request_that_exceeds_the_cap(auth_client):
+    c, engine = auth_client
+    S.STATE.rate_limit_per_min = 2
+    _auth_post(c, key="key-a")
+    _auth_post(c, key="key-a")
+    r = _auth_post(c, key="key-a")
+    assert r.status_code == 429
+    assert len(engine.calls) == 2
+
+
+def test_rate_limit_is_per_customer_not_global(auth_multi_lora_client):
+    c, engine = auth_multi_lora_client
+    S.STATE.rate_limit_per_min = 1
+    assert _auth_post(c, key="key-a").status_code == 200
+    assert _auth_post(c, key="key-a").status_code == 429  # acme's own limit hit
+    assert _auth_post(c, key="key-b").status_code == 200  # globex is unaffected
+    assert len(engine.calls) == 2
+
+
+def test_rate_limit_is_a_noop_without_auth(client):
+    """rate_limit_per_min is meaningless without a resolved customer_id to
+    key it on -- setting it with auth disabled must not start rejecting
+    requests."""
+    c, engine, _ = client
+    S.STATE.rate_limit_per_min = 1
+    assert post(c).status_code == 200
+    assert post(c).status_code == 200  # would be the 2nd over a limit of 1, still fine
+    assert len(engine.calls) == 2
+    S.STATE.rate_limit_per_min = 0
 
 
 # --- streaming ---------------------------------------------------------------

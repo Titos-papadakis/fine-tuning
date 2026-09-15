@@ -122,6 +122,63 @@ def test_captured_rows_are_isolated_per_customer(monkeypatch, tmp_path, conn):
     assert len(b_rows) == 1 and b_rows[0]["input"] == "globex's data"
 
 
+def test_capture_ignores_a_trailing_customer_id_in_single_customer_mode(monkeypatch, tmp_path, conn):
+    """attach()'s ctx is fixed -- a customer_id argument (as serve.py always
+    passes now) must not change which log the row lands in."""
+    from ftspec.serving import serve as S
+
+    ctx = _ctx(monkeypatch, tmp_path, conn, "acme", "saas_support")
+    capture.attach(ctx)
+
+    S.STATE.on_response(_FakeRequest("hello"), "x", 1, 1, 1.0, "some-other-id")
+
+    rows = _read_jsonl(ctx.memory_dir() / "production_log.jsonl")
+    assert len(rows) == 1
+
+
+# --- attach_shared -----------------------------------------------------------
+
+def test_attach_shared_refuses_without_auth_enabled(monkeypatch, tmp_path, conn):
+    from ftspec.serving import serve as S
+
+    monkeypatch.setattr(config_mod, "REPO_ROOT", tmp_path)
+    S.STATE.api_key_resolver = None
+    with pytest.raises(RuntimeError, match="requires auth"):
+        capture.attach_shared(conn)
+
+
+def test_attach_shared_writes_to_the_resolved_customers_own_log(monkeypatch, tmp_path, conn):
+    from ftspec.serving import serve as S
+
+    a = _ctx(monkeypatch, tmp_path, conn, "acme", "saas_support")
+    b = _ctx(monkeypatch, tmp_path, conn, "globex", "saas_support")
+    S.STATE.api_key_resolver = {"key": "acme"}.get  # just needs to be non-None
+    try:
+        capture.attach_shared(conn)
+        S.STATE.on_response(_FakeRequest("acme's traffic"), "x", 1, 1, 1.0, "acme")
+        S.STATE.on_response(_FakeRequest("globex's traffic"), "x", 1, 1, 1.0, "globex")
+
+        a_rows = _read_jsonl(a.memory_dir() / "production_log.jsonl")
+        b_rows = _read_jsonl(b.memory_dir() / "production_log.jsonl")
+        assert len(a_rows) == 1 and a_rows[0]["input"] == "acme's traffic"
+        assert len(b_rows) == 1 and b_rows[0]["input"] == "globex's traffic"
+    finally:
+        S.STATE.api_key_resolver = None
+
+
+def test_attach_shared_skips_a_request_with_no_resolved_customer_id(monkeypatch, tmp_path, conn):
+    from ftspec.serving import serve as S
+
+    a = _ctx(monkeypatch, tmp_path, conn, "acme", "saas_support")
+    S.STATE.api_key_resolver = {"key": "acme"}.get
+    try:
+        capture.attach_shared(conn)
+        S.STATE.on_response(_FakeRequest("no identity"), "x", 1, 1, 1.0, None)  # not raised
+        assert _read_jsonl(a.memory_dir() / "production_log.jsonl") == []
+    finally:
+        S.STATE.api_key_resolver = None
+
+
 # --- review_queue ----------------------------------------------------------------
 
 def _write_production_log(ctx, rows):

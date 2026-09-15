@@ -56,6 +56,10 @@ learning_app = typer.Typer(
     help="Cross-customer technique stats (scores/configs only, never customer data).",
     no_args_is_help=True)
 app.add_typer(learning_app, name="learning")
+apikey_app = typer.Typer(help="API keys for the serving layer.", no_args_is_help=True)
+app.add_typer(apikey_app, name="api-key")
+usage_app = typer.Typer(help="Per-customer usage/billing counters.", no_args_is_help=True)
+app.add_typer(usage_app, name="usage")
 
 log = get_logger("ftplatform.cli")
 
@@ -553,6 +557,12 @@ def serve_customer(
     gpu_memory_utilization: float = typer.Option(0.90),
     capture: bool = typer.Option(
         True, help="Capture request/response pairs for the self-improve review queue."),
+    cache_size: int = typer.Option(0, help="Exact-match response cache size (0 disables it)."),
+    require_auth: bool = typer.Option(
+        True, "--require-auth/--no-require-auth",
+        help="Require a valid API key on every request (see `ftplatform api-key create`). "
+             "On by default for anything customer-facing -- turn off only for local dev."),
+    rate_limit_per_min: int = typer.Option(0, help="Per-minute request cap (0 disables it)."),
 ):
     """Serve this customer's currently-deployed production model.
 
@@ -563,39 +573,58 @@ def serve_customer(
     """
     import json as json_mod
 
+    from ftplatform.auth import keys as keys_mod
+    from ftplatform.billing import usage as usage_mod
+    from ftplatform.serving.hooks import compose
     from ftspec.serving.serve import serve as serve_fn
 
     conn = connect()
     try:
-        ctx = CustomerContext(conn, customer_id)
-    except UnknownCustomerError as e:
-        typer.secho(str(e), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from e
+        try:
+            ctx = CustomerContext(conn, customer_id)
+        except UnknownCustomerError as e:
+            typer.secho(str(e), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from e
+
+        production = ctx.production_dir()
+        merged = production / "merged_model"
+        adapter = production / "lora_adapter"
+        meta_path = production / "candidate_meta.json"
+
+        if merged.exists():
+            model, lora = str(merged), None
+        elif adapter.exists() and meta_path.exists():
+            base_model = json_mod.loads(meta_path.read_text(encoding="utf-8"))["base_model"]
+            model, lora = base_model, str(adapter)
+        else:
+            typer.secho(f"\nnothing deployed for {customer_id!r} yet -- run "
+                         f"`ftplatform deploy run {customer_id} --candidate-id ...` first.\n",
+                         fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+
+        api_key_resolver = None
+        if require_auth:
+            if not keys_mod.list_keys(conn, customer_id):
+                typer.secho(
+                    f"\n{customer_id!r} has no API key yet -- run "
+                    f"`ftplatform api-key create {customer_id}` first, or pass "
+                    f"--no-require-auth for local dev.\n", fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1)
+            api_key_resolver = keys_mod.build_resolver(conn, customer_ids={customer_id})
+
+        hooks = [usage_mod.build_hook(conn)]
+        if capture:
+            from ftplatform.monitoring import capture as capture_mod
+            hooks.append(capture_mod.build_hook(ctx))
+        import ftspec.serving.serve as serve_mod
+        serve_mod.STATE.on_response = compose(*hooks)
     finally:
         conn.close()
 
-    production = ctx.production_dir()
-    merged = production / "merged_model"
-    adapter = production / "lora_adapter"
-    meta_path = production / "candidate_meta.json"
-
-    if merged.exists():
-        model, lora = str(merged), None
-    elif adapter.exists() and meta_path.exists():
-        base_model = json_mod.loads(meta_path.read_text(encoding="utf-8"))["base_model"]
-        model, lora = base_model, str(adapter)
-    else:
-        typer.secho(f"\nnothing deployed for {customer_id!r} yet -- run "
-                     f"`ftplatform deploy run {customer_id} --candidate-id ...` first.\n",
-                     fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    if capture:
-        from ftplatform.monitoring import capture as capture_mod
-        capture_mod.attach(ctx)
-
     serve_fn(model=model, profile=ctx.profile, lora=lora, host=host, port=port,
-              max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization)
+              max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization,
+              cache_size=cache_size, api_key_resolver=api_key_resolver,
+              rate_limit_per_min=rate_limit_per_min)
 
 
 @review_app.command("scan")
@@ -962,6 +991,16 @@ def serve_shared(
     gpu_memory_utilization: float = typer.Option(0.90),
     max_lora_rank: int = typer.Option(16),
     cache_size: int = typer.Option(0, help="Exact-match response cache size (0 disables it)."),
+    capture: bool = typer.Option(
+        True, help="Capture request/response pairs for the self-improve review queue "
+                    "(requires auth -- see --require-auth)."),
+    require_auth: bool = typer.Option(
+        True, "--require-auth/--no-require-auth",
+        help="Require a valid API key on every request, resolved to the customer whose "
+             "adapter is then used -- without this, ANY caller can select ANY served "
+             "customer's adapter just by naming it, so --no-require-auth is a real "
+             "cross-customer exposure, not a convenience toggle. Off only for local dev."),
+    rate_limit_per_min: int = typer.Option(0, help="Per-customer request cap (0 disables it)."),
 ):
     """Serve every customer on `workload` with a production deployment from
     ONE shared vLLM engine -- one base model's weights loaded once, each
@@ -970,10 +1009,13 @@ def serve_shared(
     customer.
 
     Customers whose production adapter was trained from a different base
-    model than the majority are excluded and named in the output; a request
-    picks its adapter by passing the customer id as the OpenAI `model`
-    field.
+    model than the majority are excluded and named in the output. With auth
+    on (the default), the adapter is chosen by the caller's API key, not by
+    the `model` field it sends.
     """
+    from ftplatform.auth import keys as keys_mod
+    from ftplatform.billing import usage as usage_mod
+    from ftplatform.serving.hooks import compose
     from ftplatform.serving.shared_server import discover_production_adapters, group_by_base_model
     from ftspec.core.registry import load_profile
     from ftspec.serving.serve import serve as ftspec_serve
@@ -981,32 +1023,173 @@ def serve_shared(
     conn = connect()
     try:
         adapters = discover_production_adapters(conn, workload)
+        if not adapters:
+            typer.secho(f"no customer on workload {workload!r} has a production deployment yet",
+                         fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+
+        groups = group_by_base_model(adapters)
+        if not groups:
+            typer.secho("no customer's base model could be determined -- nothing to serve",
+                         fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+
+        base_model, lora = max(groups.items(), key=lambda kv: len(kv[1]))
+        excluded = set(adapters) - set(lora)
+        typer.echo(f"\nserving {len(lora)} customer(s) on base model {base_model!r}: "
+                    f"{sorted(lora)}")
+        if excluded:
+            typer.secho(f"excluded (different base model, run again on a separate instance "
+                         f"for these): {sorted(excluded)}", fg=typer.colors.YELLOW)
+
+        api_key_resolver = None
+        if require_auth:
+            api_key_resolver = keys_mod.build_resolver(conn, customer_ids=set(lora))
+            keyless = [c for c in lora if not keys_mod.list_keys(conn, c)]
+            if keyless:
+                typer.secho(f"note: {sorted(keyless)} have no API key yet and cannot be "
+                             f"reached until one exists (`ftplatform api-key create ...`)",
+                             fg=typer.colors.YELLOW)
+        else:
+            typer.secho("\n--no-require-auth on a shared server: any caller can select any "
+                         "served customer's adapter by name. Do not use this against real "
+                         "customer traffic.\n", fg=typer.colors.RED, err=True)
+
+        import ftspec.serving.serve as serve_mod
+        serve_mod.STATE.api_key_resolver = api_key_resolver  # so build_hook_shared() sees it
+
+        hooks = [usage_mod.build_hook(conn)]
+        if capture and require_auth:
+            from ftplatform.monitoring import capture as capture_mod
+            hooks.append(capture_mod.build_hook_shared(conn))
+        elif capture:
+            typer.secho("capture disabled: it requires auth to know which customer a "
+                         "request belongs to (see --require-auth)", fg=typer.colors.YELLOW)
+        serve_mod.STATE.on_response = compose(*hooks)
     finally:
         conn.close()
-
-    if not adapters:
-        typer.secho(f"no customer on workload {workload!r} has a production deployment yet",
-                     fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    groups = group_by_base_model(adapters)
-    if not groups:
-        typer.secho("no customer's base model could be determined -- nothing to serve",
-                     fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    base_model, lora = max(groups.items(), key=lambda kv: len(kv[1]))
-    excluded = set(adapters) - set(lora)
-    typer.echo(f"\nserving {len(lora)} customer(s) on base model {base_model!r}: "
-                f"{sorted(lora)}")
-    if excluded:
-        typer.secho(f"excluded (different base model, run again on a separate instance "
-                     f"for these): {sorted(excluded)}", fg=typer.colors.YELLOW)
 
     profile = load_profile(workload)
     ftspec_serve(base_model, profile, lora=lora, host=host, port=port,
                  max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization,
-                 max_lora_rank=max_lora_rank, cache_size=cache_size)
+                 max_lora_rank=max_lora_rank, cache_size=cache_size,
+                 api_key_resolver=api_key_resolver, rate_limit_per_min=rate_limit_per_min)
+
+
+@apikey_app.command("create")
+def apikey_create(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    label: str = typer.Option("", help="A note to tell this key apart from others later."),
+):
+    """Create a new API key for a customer. Shown once, here -- only its
+    hash is ever stored, so losing it means creating a new one, not
+    recovering this one."""
+    from ftplatform.auth import keys as keys_mod
+
+    conn = connect()
+    try:
+        try:
+            CustomerContext(conn, customer_id)
+        except UnknownCustomerError as e:
+            typer.secho(str(e), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from e
+        key = keys_mod.create_key(conn, customer_id, label=label)
+    finally:
+        conn.close()
+
+    typer.secho(f"\n{key}\n", fg=typer.colors.GREEN)
+    typer.echo("This is shown once -- store it now. It will not be shown again.")
+
+
+@apikey_app.command("list")
+def apikey_list(customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'.")):
+    """List a customer's keys -- metadata only, never the plaintext."""
+    from ftplatform.auth import keys as keys_mod
+
+    conn = connect()
+    try:
+        rows = keys_mod.list_keys(conn, customer_id)
+    finally:
+        conn.close()
+
+    if not rows:
+        typer.echo(f"no API keys for {customer_id!r}")
+        return
+    typer.echo(f"\n  {'key_hash (prefix)':<20} {'label':<16} {'created_at':<22} status")
+    typer.echo("  " + "-" * 80)
+    for r in rows:
+        status = "revoked" if r["revoked_at"] else "active"
+        typer.echo(f"  {r['key_hash'][:16]:<20} {r['label']:<16} {r['created_at']:<22} {status}")
+    typer.echo("")
+
+
+@apikey_app.command("revoke")
+def apikey_revoke(
+    key_hash_prefix: str = typer.Argument(
+        ..., help="A prefix of the key_hash shown by `api-key list` -- long enough to be "
+                   "unambiguous, e.g. the first 12-16 characters."),
+):
+    """Revoke a key immediately. A revoked key never resolves again, but
+    the row stays (audit trail) -- it is not deleted."""
+    from ftplatform.auth import keys as keys_mod
+
+    conn = connect()
+    try:
+        n = keys_mod.revoke_key(conn, key_hash_prefix)
+    finally:
+        conn.close()
+
+    if n == 0:
+        typer.secho(f"no active key matched prefix {key_hash_prefix!r}", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+    typer.secho(f"\n{n} key(s) revoked.", fg=typer.colors.GREEN)
+
+
+@usage_app.command("report")
+def usage_report(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    period: str | None = typer.Option(None, help="'YYYY-MM'. Defaults to the current month."),
+):
+    """This customer's usage for one billing period."""
+    from ftplatform.billing import usage as usage_mod
+
+    conn = connect()
+    try:
+        r = usage_mod.report(conn, customer_id, period=period)
+    finally:
+        conn.close()
+
+    typer.echo(f"\n{customer_id} / {r['period']}")
+    typer.echo(f"  requests:           {r['requests']}")
+    typer.echo(f"  prompt tokens:      {r['prompt_tokens']}")
+    typer.echo(f"  completion tokens:  {r['completion_tokens']}")
+    typer.echo(f"  cache hits:         {r['cache_hits']}\n")
+
+
+@usage_app.command("report-all")
+def usage_report_all(
+    period: str | None = typer.Option(None, help="'YYYY-MM'. Defaults to the current month."),
+):
+    """Every customer's usage for one billing period -- the input to
+    actually invoicing people."""
+    from ftplatform.billing import usage as usage_mod
+
+    conn = connect()
+    try:
+        rows = usage_mod.report_all(conn, period=period)
+    finally:
+        conn.close()
+
+    if not rows:
+        typer.echo("no usage recorded for this period")
+        return
+    typer.echo(f"\n  {'customer':<16} {'requests':>9} {'prompt tok':>11} "
+                f"{'completion tok':>15} {'cache hits':>11}")
+    typer.echo("  " + "-" * 70)
+    for r in rows:
+        typer.echo(f"  {r['customer_id']:<16} {r['requests']:>9} {r['prompt_tokens']:>11} "
+                    f"{r['completion_tokens']:>15} {r['cache_hits']:>11}")
+    typer.echo("")
 
 
 if __name__ == "__main__":

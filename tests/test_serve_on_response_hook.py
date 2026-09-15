@@ -54,11 +54,12 @@ def test_on_response_fires_for_a_non_streaming_request(mock_client):
     client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
 
     assert len(calls) == 1
-    req, text, p_tok, c_tok, elapsed_ms = calls[0]
+    req, text, p_tok, c_tok, elapsed_ms, customer_id = calls[0]
     assert req.messages[0].content == "hi"
     assert isinstance(text, str) and text
     assert p_tok > 0 and c_tok > 0
     assert elapsed_ms >= 0
+    assert customer_id is None  # no auth configured in this fixture
 
 
 def test_on_response_fires_for_a_streaming_request_with_the_full_text(mock_client):
@@ -71,11 +72,12 @@ def test_on_response_fires_for_a_streaming_request_with_the_full_text(mock_clien
         b"".join(r.iter_bytes())
 
     assert len(calls) == 1
-    _req, text, p_tok, c_tok, elapsed_ms = calls[0]
+    _req, text, p_tok, c_tok, elapsed_ms, customer_id = calls[0]
     assert isinstance(text, str) and text  # the full accumulated text, not just the last delta
     # Documented gap: streaming never computes token counts today.
     assert p_tok == 0 and c_tok == 0
     assert elapsed_ms >= 0
+    assert customer_id is None  # no auth configured in this fixture
 
 
 def test_on_response_fires_once_per_request_not_once_per_chunk(mock_client):

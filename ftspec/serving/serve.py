@@ -124,12 +124,15 @@ class ServerState:
     # Bounded on purpose: /health reports recent behaviour, and an unbounded
     # list on a long-lived server is a slow memory leak.
     latencies_ms: deque = field(default_factory=lambda: deque(maxlen=512))
-    # Optional: (request, text, prompt_tokens, completion_tokens, elapsed_ms)
-    # -> None, called after every completed request. None by default, so
-    # serving behaviour is unchanged unless something sets it -- this is how
-    # ftplatform.monitoring.capture attaches production-traffic logging
-    # without this module knowing ftplatform exists.
-    on_response: Callable[[Any, str, int, int, float], None] | None = None
+    # Optional: (request, text, prompt_tokens, completion_tokens, elapsed_ms,
+    # customer_id) -> None, called after every completed request.
+    # customer_id is the auth-resolved identity (None when auth is off, or
+    # for the streaming path before any auth was added -- accept it as an
+    # optional parameter, not a required one, for exactly that reason). None
+    # by default, so serving behaviour is unchanged unless something sets
+    # it -- this is how ftplatform.monitoring.capture / ftplatform.billing.usage
+    # attach without this module knowing either package exists.
+    on_response: Callable[[Any, str, int, int, float, str | None], None] | None = None
     # Exact-match cache for non-streaming, temperature=0 requests (see
     # _cache_key() -- a request at any other temperature is never cached,
     # since caching would silently make sampling deterministic). 0 (the
@@ -142,6 +145,21 @@ class ServerState:
     cache: OrderedDict = field(default_factory=OrderedDict)
     cache_hits: int = 0
     cache_misses: int = 0
+    # Auth: None (the default) means no Authorization header is required --
+    # unchanged behavior for every existing caller (ftspec's own dev/eval
+    # tooling never sends one). Set to a (plaintext_key) -> customer_id | None
+    # callable (see ftplatform.auth.keys.build_resolver) to require a valid,
+    # non-revoked key on every request. Once auth is on, the *resolved*
+    # customer_id is authoritative for adapter selection in multi-adapter
+    # mode -- see _select_lora_request() -- a request cannot pick another
+    # customer's adapter by sending a different `model`, even deliberately.
+    api_key_resolver: Callable[[str], str | None] | None = None
+    # 0 (the default) disables rate limiting. >0 caps requests per rolling
+    # 60s window, per resolved customer_id -- meaningless without auth
+    # (there is no per-caller identity to key it on), so it is a no-op
+    # whenever api_key_resolver is None.
+    rate_limit_per_min: int = 0
+    rate_window: dict = field(default_factory=dict)
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -199,38 +217,92 @@ class UnknownModelError(Exception):
     pass
 
 
-def _select_lora_request(req: ChatCompletionRequest):
+class AuthError(Exception):
+    pass
+
+
+class RateLimitError(Exception):
+    pass
+
+
+def _select_lora_request(req: ChatCompletionRequest, customer_id: str | None = None):
     """Which adapter serves this request.
 
     Single-adapter mode (STATE.lora_requests empty, the default): every
     request uses STATE.lora_request, unchanged from before multi-tenant
-    serving existed. Multi-adapter mode: req.model must name one of the
-    registered adapters -- picked explicitly by the caller, the same way an
-    OpenAI client selects a fine-tuned model id, rather than guessed from
-    anything else about the request. An unrecognized name is refused, never
-    silently served by the wrong customer's adapter or the base model.
+    serving existed. Multi-adapter mode: `customer_id` -- when auth
+    resolved one -- is authoritative and wins over req.model, so an
+    authenticated request cannot pick another customer's adapter even by
+    sending a different `model` deliberately. Without auth, req.model
+    picks the adapter directly, the same way an OpenAI client selects a
+    fine-tuned model id. An unrecognized name is refused, never silently
+    served by the wrong customer's adapter or the base model.
     """
     if not STATE.lora_requests:
         return STATE.lora_request
-    lora_request = STATE.lora_requests.get(req.model)
+    name = customer_id if customer_id is not None else req.model
+    lora_request = STATE.lora_requests.get(name)
     if lora_request is None:
         raise UnknownModelError(
-            f"unknown model {req.model!r}. Available: {sorted(STATE.lora_requests)}")
+            f"unknown model {name!r}. Available: {sorted(STATE.lora_requests)}")
     return lora_request
 
 
-def _cache_key(req: ChatCompletionRequest) -> str | None:
+def _authenticate(authorization: str | None) -> str | None:
+    """The resolved customer_id, or None when auth is disabled
+    (STATE.api_key_resolver is None) -- unchanged behavior for every caller
+    that never sends an Authorization header. Raises AuthError when auth is
+    enabled and the header is missing, malformed, or names an unknown/
+    revoked key."""
+    if STATE.api_key_resolver is None:
+        return None
+    if not authorization or not authorization.startswith("Bearer "):
+        raise AuthError("missing or malformed Authorization header -- expected 'Bearer <key>'")
+    key = authorization[len("Bearer "):].strip()
+    customer_id = STATE.api_key_resolver(key)
+    if customer_id is None:
+        raise AuthError("invalid or revoked API key")
+    return customer_id
+
+
+def _check_rate_limit(customer_id: str | None) -> None:
+    """No-op when rate limiting is off (rate_limit_per_min <= 0) or there is
+    no authenticated identity to key it on. Fixed 60s windows, not a
+    sliding log -- good enough to stop one noisy customer from starving
+    others on a shared engine, not a precise rate-limiting guarantee."""
+    if STATE.rate_limit_per_min <= 0 or customer_id is None:
+        return
+    now = time.time()
+    window_start, count = STATE.rate_window.get(customer_id, (now, 0))
+    if now - window_start >= 60.0:
+        window_start, count = now, 0
+    count += 1
+    STATE.rate_window[customer_id] = (window_start, count)
+    if count > STATE.rate_limit_per_min:
+        raise RateLimitError(f"rate limit exceeded: {STATE.rate_limit_per_min} requests/min")
+
+
+def _cache_key(req: ChatCompletionRequest, customer_id: str | None = None) -> str | None:
     """None means "don't cache this request" -- only temperature=0 (the
     server's own default) is exact-match cacheable; caching a nonzero-
     temperature request would silently turn sampling deterministic, which
     is not what a caller asking for temperature>0 wants. Includes every
-    field that affects the output (model/adapter, messages, decoding
-    params, constrained on/off), so two requests only collide when they
-    would genuinely produce the same result."""
+    field that affects the output (adapter, messages, decoding params,
+    constrained on/off), so two requests only collide when they would
+    genuinely produce the same result.
+
+    `customer_id`, when auth resolved one, is used *instead of* req.model
+    to identify the adapter -- req.model is client-supplied and, with auth
+    on, is not what actually selects the adapter (see
+    _select_lora_request()); keying the cache on it instead would let two
+    customers who both send the same (or no) `model` share a cache entry
+    for identical message text, silently leaking one customer's cached
+    response to another.
+    """
     if req.temperature != 0.0:
         return None
     payload = json.dumps({
-        "model": req.model,
+        "model": customer_id if customer_id is not None else req.model,
         "messages": [m.model_dump() for m in req.messages],
         "top_p": req.top_p,
         "max_tokens": req.max_tokens,
@@ -241,7 +313,7 @@ def _cache_key(req: ChatCompletionRequest) -> str | None:
 
 def _record_response(req: ChatCompletionRequest, text: str, prompt_tokens: int,
                       completion_tokens: int, elapsed_ms: float, constrained: bool,
-                      request_id: str) -> None:
+                      request_id: str, customer_id: str | None) -> None:
     STATE.served_requests += 1
     STATE.latencies_ms.append(elapsed_ms)
     if constrained:
@@ -250,10 +322,12 @@ def _record_response(req: ChatCompletionRequest, text: str, prompt_tokens: int,
         log.warning("request %s served UNCONSTRAINED at client request", request_id)
     if STATE.on_response is not None:
         try:
-            STATE.on_response(req, text, prompt_tokens, completion_tokens, elapsed_ms)
+            STATE.on_response(req, text, prompt_tokens, completion_tokens, elapsed_ms,
+                               customer_id)
         except Exception:                                             # noqa: BLE001
-            # A side-channel observer (production-traffic capture, say) must
-            # never take an actual served response down with it.
+            # A side-channel observer (production-traffic capture, usage
+            # metering, say) must never take an actual served response down
+            # with it.
             log.exception("on_response hook failed; the response itself was unaffected")
 
 
@@ -279,18 +353,20 @@ def render_prompt(messages: list) -> str:
         conversation, tokenize=False, add_generation_prompt=True)
 
 
-async def generate_once(req: ChatCompletionRequest) -> tuple[str, int, int]:
-    lora_request = _select_lora_request(req)  # raises UnknownModelError before any generation
+async def generate_once(req: ChatCompletionRequest,
+                         customer_id: str | None = None) -> tuple[str, int, int]:
+    # raises UnknownModelError before any generation
+    lora_request = _select_lora_request(req, customer_id)
     constrained = not req.ftspec_unconstrained
     request_id = f"ftspec-{uuid.uuid4().hex[:12]}"
-    cache_key = _cache_key(req) if STATE.cache_max_size > 0 else None
+    cache_key = _cache_key(req, customer_id) if STATE.cache_max_size > 0 else None
 
     if cache_key is not None and cache_key in STATE.cache:
         STATE.cache_hits += 1
         STATE.cache.move_to_end(cache_key)
         text, prompt_tokens, completion_tokens = STATE.cache[cache_key]
         _record_response(req, text, prompt_tokens, completion_tokens, 0.0, constrained,
-                          request_id)
+                          request_id, customer_id)
         return text, prompt_tokens, completion_tokens
     if cache_key is not None:
         STATE.cache_misses += 1
@@ -319,12 +395,12 @@ async def generate_once(req: ChatCompletionRequest) -> tuple[str, int, int]:
             STATE.cache.popitem(last=False)  # evict least-recently-used
 
     _record_response(req, text, prompt_tokens, completion_tokens, elapsed_ms, constrained,
-                      request_id)
+                      request_id, customer_id)
     return text, prompt_tokens, completion_tokens
 
 
 def create_app(respect_client_system_prompt: bool = False):
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, Header, HTTPException
     from fastapi.responses import StreamingResponse
 
     STATE.respect_client_system_prompt = respect_client_system_prompt
@@ -357,6 +433,8 @@ def create_app(respect_client_system_prompt: bool = False):
                 "cache": {"enabled": STATE.cache_max_size > 0, "size": len(STATE.cache),
                            "max_size": STATE.cache_max_size, "hits": STATE.cache_hits,
                            "misses": STATE.cache_misses},
+                "auth_required": STATE.api_key_resolver is not None,
+                "rate_limit_per_min": STATE.rate_limit_per_min or None,
                 "uptime_s": round(time.time() - STATE.started_at, 1),
                 "latency_ms": {"count": len(recent),
                                 "p50": _percentile(recent, 50),
@@ -401,18 +479,29 @@ def create_app(respect_client_system_prompt: bool = False):
                 "cache_hits": STATE.cache_hits, "cache_misses": STATE.cache_misses}
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatCompletionRequest):
+    async def chat_completions(req: ChatCompletionRequest, authorization: str | None = Header(None)):
         if STATE.engine is None:
             raise HTTPException(status_code=503, detail="engine still loading")
         if not req.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
+
+        # Auth and rate limiting resolve before anything else -- a request
+        # that fails either never touches the engine, the cache, or any
+        # on_response hook.
+        try:
+            customer_id = _authenticate(authorization)
+            _check_rate_limit(customer_id)
+        except AuthError as e:
+            raise HTTPException(status_code=401, detail=str(e)) from e
+        except RateLimitError as e:
+            raise HTTPException(status_code=429, detail=str(e)) from e
 
         created = int(time.time())
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
         if not req.stream:
             try:
-                text, p_tok, c_tok = await generate_once(req)
+                text, p_tok, c_tok = await generate_once(req, customer_id)
             except UnknownModelError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
             except Exception as e:
@@ -431,7 +520,7 @@ def create_app(respect_client_system_prompt: bool = False):
         # once StreamingResponse starts, so this is the last point a normal
         # HTTP status code is still possible.
         try:
-            lora_request = _select_lora_request(req)
+            lora_request = _select_lora_request(req, customer_id)
         except UnknownModelError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -489,7 +578,7 @@ def create_app(respect_client_system_prompt: bool = False):
                     # Streaming never computes prompt/completion token counts
                     # today (only generate_once's non-streaming path does) --
                     # 0 here is an honest "not measured", not an estimate.
-                    STATE.on_response(req, text, 0, 0, elapsed_ms)
+                    STATE.on_response(req, text, 0, 0, elapsed_ms, customer_id)
                 except Exception:                                     # noqa: BLE001
                     log.exception("on_response hook failed; the stream itself was unaffected")
 
@@ -500,7 +589,9 @@ def create_app(respect_client_system_prompt: bool = False):
 
 def load_engine(model: str, profile: Profile, lora: str | dict[str, str] | None,
                  max_model_len: int, gpu_memory_utilization: float, max_lora_rank: int,
-                 cache_size: int = 0) -> None:
+                 cache_size: int = 0,
+                 api_key_resolver: Callable[[str], str | None] | None = None,
+                 rate_limit_per_min: int = 0) -> None:
     """`lora`:
       - None: base model only, no adapter.
       - str: single adapter path, served to every request -- unchanged
@@ -515,6 +606,17 @@ def load_engine(model: str, profile: Profile, lora: str | dict[str, str] | None,
     >0 enables it, evicting least-recently-used entries past that many
     entries. See _cache_key() for exactly what's cached (temperature=0
     requests only) and why.
+
+    `api_key_resolver`: None (default) disables auth entirely -- every
+    request is served unauthenticated, exactly as before this existed. Set
+    it (see ftplatform.auth.keys.build_resolver) to require a valid,
+    non-revoked API key on every request; the resolved customer_id then
+    drives adapter selection and on_response's customer_id, overriding
+    whatever `model` the client sent.
+
+    `rate_limit_per_min`: 0 (default) disables rate limiting. Only takes
+    effect when `api_key_resolver` is set -- there is no per-caller
+    identity to key it on otherwise.
     """
     from transformers import AutoTokenizer
     from vllm import AsyncEngineArgs, AsyncLLMEngine
@@ -523,6 +625,9 @@ def load_engine(model: str, profile: Profile, lora: str | dict[str, str] | None,
     STATE.cache = OrderedDict()
     STATE.cache_hits = 0
     STATE.cache_misses = 0
+    STATE.api_key_resolver = api_key_resolver
+    STATE.rate_limit_per_min = rate_limit_per_min
+    STATE.rate_window = {}
     STATE.profile = profile
     STATE.schema = profile.contract.json_schema()
     STATE.system_prompt = profile.prompts.short
@@ -568,11 +673,13 @@ def load_engine(model: str, profile: Profile, lora: str | dict[str, str] | None,
 def serve(model: str, profile: Profile, lora: str | dict[str, str] | None = None,
            host: str = "0.0.0.0", port: int = 8000, max_model_len: int = 4096,
            gpu_memory_utilization: float = 0.90, max_lora_rank: int = 16,
-           respect_client_system_prompt: bool = False, cache_size: int = 0) -> None:
+           respect_client_system_prompt: bool = False, cache_size: int = 0,
+           api_key_resolver: Callable[[str], str | None] | None = None,
+           rate_limit_per_min: int = 0) -> None:
     import uvicorn
 
     load_engine(model, profile, lora, max_model_len, gpu_memory_utilization, max_lora_rank,
-                cache_size)
+                cache_size, api_key_resolver, rate_limit_per_min)
     app = create_app(respect_client_system_prompt)
 
     log.info("listening on http://%s:%d/v1/chat/completions", host, port)

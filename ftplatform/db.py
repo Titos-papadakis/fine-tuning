@@ -87,6 +87,32 @@ CREATE TABLE IF NOT EXISTS candidate_stats (
     customer_id   TEXT NOT NULL REFERENCES customers(id),
     recorded_at   TEXT NOT NULL
 );
+
+-- Serving-layer auth: a request must carry a valid, non-revoked key to be
+-- served (see ftplatform/auth/keys.py + ftspec.serving.serve's
+-- api_key_resolver). Only the sha256 hash is ever stored -- the plaintext
+-- key is shown once, at creation, and never again.
+CREATE TABLE IF NOT EXISTS api_keys (
+    key_hash      TEXT PRIMARY KEY,
+    customer_id   TEXT NOT NULL REFERENCES customers(id),
+    label         TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    revoked_at    TEXT
+);
+
+-- Per-customer metering, one row per (customer, calendar month) --
+-- aggregate counters rather than one row per request, since the point is
+-- billing/usage reporting, not a request-level audit trail (that's
+-- memory/production_log.jsonl, per customer, see ftplatform/monitoring/).
+CREATE TABLE IF NOT EXISTS usage_counters (
+    customer_id        TEXT NOT NULL REFERENCES customers(id),
+    period              TEXT NOT NULL,
+    requests            INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens       INTEGER NOT NULL DEFAULT 0,
+    completion_tokens   INTEGER NOT NULL DEFAULT 0,
+    cache_hits          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (customer_id, period)
+);
 """
 
 
