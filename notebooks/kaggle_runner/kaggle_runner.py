@@ -32,12 +32,19 @@ REPO = "https://github.com/Titos-papadakis/fine-tuning.git"
 CLONE_DIR = Path("/kaggle/working/ftspec")
 PROFILE = "saas_support"
 GPU_COST_PER_HOUR = "0.35"
-# 7.5x the 200-example default. n_eval is left at the original 150 on
-# purpose -- that's what the 36.7% Record Exact Match baseline being chased
-# here was measured on, so this run's eval stays directly comparable to it
-# rather than moving both the training data and the measuring stick at once.
-N_TRAIN = 1500
-N_VAL = 150
+# 50x the 200-example default -- deliberately large: this baseline is meant
+# to be built once and reused by every future customer's Stage B (see
+# ftplatform/learning/), so investing real GPU time in it now is worth more
+# than a fast, mediocre first pass. The generator's signal space (continuous
+# random amounts/dates, 5-digit order ids, shuffled/typo'd phrasing -- see
+# profiles/saas_support/generate.py) comfortably supports far more than
+# 10k unique, contract-valid documents; verified locally before spending any
+# GPU time on it. n_eval is left at the original 150 on purpose -- that's
+# what the 36.7% Record Exact Match baseline being chased here was measured
+# on, so this run's eval stays directly comparable to it rather than moving
+# both the training data and the measuring stick at once.
+N_TRAIN = 10000
+N_VAL = 500
 N_EVAL = 150
 EVAL_SYSTEMS = ("finetuned", "finetuned-constrained", "base-constrained", "base-rubric")
 
