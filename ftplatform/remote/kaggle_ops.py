@@ -18,15 +18,30 @@ package (see candidates/runner.py's module-level imports of `build`,
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 POLL_INTERVAL_S = 30
 DONE_STATUSES = {"complete", "error", "cancelled", "cancelling"}
+# A kernel in either of these states already has a live GPU session. Pushing
+# on top of one does NOT cancel it -- confirmed the hard way running this
+# project's own saas_support baseline: a push meant to replace a stuck run
+# instead started a second, concurrent one, and together they drained a
+# week's GPU quota (25.93 of 30h) before either finished.
+RUNNING_LIKE_STATUSES = {"running", "queued"}
 
 
 class KaggleCommandError(RuntimeError):
+    pass
+
+
+class InsufficientQuotaError(KaggleCommandError):
+    pass
+
+
+class ConcurrentSessionError(KaggleCommandError):
     pass
 
 
@@ -103,6 +118,55 @@ def write_kernel_metadata(kernel_dir: Path, owner: str, slug: str, title: str,
 
 def push_kernel(kernel_dir: Path, run=subprocess.run) -> None:
     _kaggle(["kernels", "push", "-p", str(kernel_dir)], run=run)
+
+
+_QUOTA_ROW = re.compile(r"^(GPU|TPU)\s+([\d.]+)h\s+([\d.]+)h\s+([\d.]+)h\s+(\S+)", re.MULTILINE)
+
+
+def get_gpu_quota(run=subprocess.run) -> dict:
+    """Parses `kaggle quota`'s GPU row: {"used", "remaining", "total"} in
+    hours (float) plus "refresh_at" (the ISO timestamp Kaggle prints, passed
+    through as-is -- not parsed as a datetime since nothing here needs to do
+    arithmetic on it, only show it in a message)."""
+    result = _kaggle(["quota"], run=run)
+    for resource, used, remaining, total, refresh_at in _QUOTA_ROW.findall(result.stdout):
+        if resource == "GPU":
+            return {"used": float(used), "remaining": float(remaining),
+                     "total": float(total), "refresh_at": refresh_at}
+    raise KaggleCommandError(f"could not find a GPU row in `kaggle quota` output:\n{result.stdout}")
+
+
+def preflight_check(kernel_id: str, required_hours: float | None = None,
+                     run=subprocess.run) -> None:
+    """Raise before a push that would repeat either half of the same real
+    failure: pushing a run that can't fit in what's left of the weekly GPU
+    quota, or pushing a second session on top of one already running (see
+    RUNNING_LIKE_STATUSES). The quota check is skipped when `required_hours`
+    is None -- callers who don't know their run's expected length yet still
+    get the concurrency check, which needs no estimate to be worth doing."""
+    if required_hours is not None:
+        quota = get_gpu_quota(run=run)
+        if quota["remaining"] < required_hours:
+            raise InsufficientQuotaError(
+                f"only {quota['remaining']:.2f}h GPU quota remain (need ~{required_hours:.2f}h); "
+                f"resets at {quota['refresh_at']}")
+
+    status = kernel_status(kernel_id, run=run)
+    if status in RUNNING_LIKE_STATUSES:
+        raise ConcurrentSessionError(
+            f"{kernel_id} already has status {status!r} -- pushing now would start a "
+            f"second, concurrent session instead of replacing it, doubling GPU-hour "
+            f"burn. Stop the existing session first.")
+
+
+def safe_push_kernel(kernel_dir: Path, kernel_id: str, required_hours: float | None = None,
+                      run=subprocess.run) -> None:
+    """push_kernel(), guarded by preflight_check(). Raises instead of pushing
+    when the check fails -- callers that need the caller-claims-the-job
+    ordering of the old push_kernel() (see run_on_kaggle.start_job_on_kaggle)
+    should call preflight_check() explicitly before claiming, then push_kernel()."""
+    preflight_check(kernel_id, required_hours, run=run)
+    push_kernel(kernel_dir, run=run)
 
 
 def _parse_kernel_status(raw_stdout: str) -> str:

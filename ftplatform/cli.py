@@ -10,6 +10,8 @@ no command here is allowed to use an unscoped path.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 
 from ftplatform.customers import store
@@ -907,16 +909,23 @@ def kaggle_start(
     job_id: str = typer.Argument(..., help="A job id from `job enqueue`/`job list`."),
     customer_id: str = typer.Argument(..., help="Customer id the job belongs to."),
     owner: str = typer.Option(..., help="Your Kaggle username."),
+    required_hours: float = typer.Option(
+        None, help="Refuse to push if remaining weekly GPU quota is below this, or if "
+                    "this job's kernel already has a session running/queued."),
 ):
     """Export a pending job, upload it as a private Kaggle dataset, and push
     the kernel that runs it. Does not wait -- run `kaggle poll` afterwards
     (repeatedly, until it reports something other than 'still running')."""
+    from ftplatform.remote import kaggle_ops
     from ftplatform.remote.run_on_kaggle import default_work_dir, start_job_on_kaggle
 
     conn = connect()
     try:
         result = start_job_on_kaggle(conn, customer_id, job_id, owner,
-                                      default_work_dir(job_id))
+                                      default_work_dir(job_id), required_hours=required_hours)
+    except (kaggle_ops.InsufficientQuotaError, kaggle_ops.ConcurrentSessionError) as e:
+        typer.secho(f"refusing to push: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
     finally:
         conn.close()
     typer.secho(f"\npushed kernel {result['kernel_id']!r} for job {job_id!r}.",
@@ -924,6 +933,40 @@ def kaggle_start(
     typer.echo(f"  dataset: {result['dataset_id']}")
     typer.echo(f"  check progress with: ftplatform kaggle poll {job_id} {customer_id} "
                f"--owner {owner}")
+
+
+@kaggle_app.command("quota")
+def kaggle_quota():
+    """Show the weekly Kaggle GPU/TPU quota (used/remaining/total/refresh)."""
+    from ftplatform.remote import kaggle_ops
+
+    quota = kaggle_ops.get_gpu_quota()
+    typer.echo(f"GPU: {quota['used']:.2f}h used, {quota['remaining']:.2f}h remaining "
+               f"of {quota['total']:.2f}h -- resets {quota['refresh_at']}")
+
+
+@kaggle_app.command("push")
+def kaggle_push(
+    kernel_dir: Path = typer.Argument(..., help="Directory with kernel-metadata.json + code, "
+                                                  "e.g. notebooks/kaggle_runner."),
+    kernel_id: str = typer.Option(..., help="owner/slug -- must match kernel-metadata.json's id."),
+    required_hours: float = typer.Option(
+        None, help="Refuse to push if remaining weekly GPU quota is below this."),
+):
+    """Push any kernel directory through the same quota/concurrency guard as
+    `kaggle start` -- for ad-hoc kernels (like notebooks/kaggle_runner's
+    baseline script) that don't go through the job-packet pipeline. Always
+    refuses if the kernel already has a session running/queued, since a push
+    on top of one does not cancel it -- it starts a second, concurrent
+    session and doubles GPU-hour burn instead."""
+    from ftplatform.remote import kaggle_ops
+
+    try:
+        kaggle_ops.safe_push_kernel(kernel_dir, kernel_id, required_hours)
+    except (kaggle_ops.InsufficientQuotaError, kaggle_ops.ConcurrentSessionError) as e:
+        typer.secho(f"refusing to push: {e}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    typer.secho(f"pushed {kernel_id!r} from {kernel_dir}", fg=typer.colors.GREEN)
 
 
 @kaggle_app.command("poll")

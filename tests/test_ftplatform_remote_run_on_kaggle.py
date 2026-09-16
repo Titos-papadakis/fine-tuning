@@ -87,6 +87,60 @@ def test_start_job_on_kaggle_writes_the_packet_before_uploading(monkeypatch, loc
     assert len(seen_packet_dirs) == 1
 
 
+def test_start_job_on_kaggle_skips_the_preflight_check_when_required_hours_is_none(monkeypatch, local):
+    # Old default behavior, unchanged: no "kernels status" call at all.
+    conn, repo_root = local
+    job_id = queue.enqueue(conn, "acme", "baseline", {})
+    monkeypatch.setattr(kaggle_ops, "upload_packet_dataset", lambda *a, **kw: "alice/ds")
+    monkeypatch.setattr(kaggle_ops, "push_kernel", lambda *a, **kw: None)
+
+    def must_not_be_called(*a, **kw):
+        raise AssertionError("preflight_check should not run when required_hours is None")
+    monkeypatch.setattr(kaggle_ops, "preflight_check", must_not_be_called)
+
+    run_on_kaggle.start_job_on_kaggle(conn, "acme", job_id, "alice", repo_root / "work",
+                                       repo_root=repo_root)
+
+    assert queue.get(conn, job_id)["status"] == "running"
+
+
+def test_start_job_on_kaggle_runs_the_preflight_check_when_required_hours_is_given(monkeypatch, local):
+    conn, repo_root = local
+    job_id = queue.enqueue(conn, "acme", "baseline", {})
+    seen = []
+    monkeypatch.setattr(kaggle_ops, "preflight_check",
+                         lambda kernel_id, hours, run=None: seen.append((kernel_id, hours)))
+    monkeypatch.setattr(kaggle_ops, "upload_packet_dataset", lambda *a, **kw: "alice/ds")
+    monkeypatch.setattr(kaggle_ops, "push_kernel", lambda *a, **kw: None)
+
+    run_on_kaggle.start_job_on_kaggle(conn, "acme", job_id, "alice", repo_root / "work",
+                                       repo_root=repo_root, required_hours=2.5)
+
+    assert seen == [(f"alice/ftplatform-job-{job_id}", 2.5)]
+
+
+def test_start_job_on_kaggle_does_not_claim_the_job_when_the_preflight_check_fails(monkeypatch, local):
+    # A rejected push must leave the job exactly as pending as it was --
+    # never marked 'running' for a push that never happened.
+    conn, repo_root = local
+    job_id = queue.enqueue(conn, "acme", "baseline", {})
+
+    def fail(*a, **kw):
+        raise kaggle_ops.ConcurrentSessionError("already running")
+    monkeypatch.setattr(kaggle_ops, "preflight_check", fail)
+
+    def must_not_be_called(*a, **kw):
+        raise AssertionError("nothing should be uploaded/pushed after a failed preflight check")
+    monkeypatch.setattr(kaggle_ops, "upload_packet_dataset", must_not_be_called)
+    monkeypatch.setattr(kaggle_ops, "push_kernel", must_not_be_called)
+
+    with pytest.raises(kaggle_ops.ConcurrentSessionError):
+        run_on_kaggle.start_job_on_kaggle(conn, "acme", job_id, "alice", repo_root / "work",
+                                           repo_root=repo_root, required_hours=2.5)
+
+    assert queue.get(conn, job_id)["status"] == "pending"
+
+
 # --- poll_and_finish_job ------------------------------------------------------
 
 def test_poll_and_finish_job_returns_none_while_still_running(monkeypatch, local):

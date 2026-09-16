@@ -55,14 +55,25 @@ def _claim_job(conn: sqlite3.Connection, job_id: str) -> None:
 
 def start_job_on_kaggle(conn: sqlite3.Connection, customer_id: str, job_id: str,
                          owner: str, work_dir: Path, repo_root: Path | None = None,
+                         required_hours: float | None = None,
                          run=subprocess.run) -> dict:
     """Exports the job as a packet, uploads it as a private Kaggle dataset,
     and pushes the kernel that will run it. Returns
     {"kernel_id", "dataset_id", "work_dir"}. Does not wait for the run to
-    finish -- call poll_and_finish_job() afterwards, as many times as needed."""
+    finish -- call poll_and_finish_job() afterwards, as many times as needed.
+
+    `required_hours`, when given, runs kaggle_ops.preflight_check() before
+    the job is claimed or anything is pushed -- so a quota/concurrency
+    failure leaves the job exactly as pending as it was, not marked
+    'running' for a push that never happened. None (the default) skips the
+    check, unchanged from before this guard existed."""
     work_dir = Path(work_dir)
     packet_dir = work_dir / "packet"
     kernel_dir = work_dir / "kernel"
+    kernel_id = kernel_id_for(job_id, owner)
+
+    if required_hours is not None:
+        kaggle_ops.preflight_check(kernel_id, required_hours, run=run)
 
     packet.export_job_packet(conn, customer_id, job_id, packet_dir, repo_root=repo_root)
 
@@ -78,7 +89,7 @@ def start_job_on_kaggle(conn: sqlite3.Connection, customer_id: str, job_id: str,
     kaggle_ops.push_kernel(kernel_dir, run=run)
 
     _claim_job(conn, job_id)
-    return {"kernel_id": kernel_id_for(job_id, owner), "dataset_id": dataset_id,
+    return {"kernel_id": kernel_id, "dataset_id": dataset_id,
             "work_dir": str(work_dir)}
 
 

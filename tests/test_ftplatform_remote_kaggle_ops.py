@@ -119,3 +119,74 @@ def test_a_nonzero_exit_raises_kaggle_command_error(tmp_path):
     with pytest.raises(kaggle_ops.KaggleCommandError):
         kaggle_ops._kaggle(["kernels", "push", "-p", str(tmp_path)],
                             run=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "boom"))
+
+
+# --- get_gpu_quota / preflight_check / safe_push_kernel ----------------------
+# These exist because pushing this project's own real 10k-example baseline
+# twice in a row burned a week's GPU quota (25.93 of 30h) for zero usable
+# output: once from an eval-frequency bug that made the run too slow to
+# finish in one Kaggle session, and once because `kernels push` does not
+# cancel an in-flight session -- it was mistaken for a replacement and
+# instead ran a second, concurrent one alongside the first.
+
+QUOTA_STDOUT = (
+    "resource  used    remaining  total   refreshAt            \r\n"
+    "--------  ------  ---------  ------  -------------------  \r\n"
+    "GPU       25.93h  4.07h      30.00h  2026-09-19T00:00:00  \r\n"
+    "TPU       0.00h   20.00h     20.00h  2026-09-19T00:00:00  \r\n"
+)
+
+
+def test_get_gpu_quota_parses_the_gpu_row_only():
+    fake = FakeRun({("quota",): (0, QUOTA_STDOUT)})
+    quota = kaggle_ops.get_gpu_quota(run=fake)
+    assert quota == {"used": 25.93, "remaining": 4.07, "total": 30.0,
+                       "refresh_at": "2026-09-19T00:00:00"}
+
+
+def test_get_gpu_quota_raises_if_no_gpu_row_is_found():
+    fake = FakeRun({("quota",): (0, "nothing recognizable here")})
+    with pytest.raises(kaggle_ops.KaggleCommandError):
+        kaggle_ops.get_gpu_quota(run=fake)
+
+
+def test_preflight_check_passes_with_enough_quota_and_no_running_session():
+    fake = FakeRun({("quota",): (0, QUOTA_STDOUT),
+                     ("kernels", "status", "alice/job-1"): (0, "status: complete")})
+    kaggle_ops.preflight_check("alice/job-1", required_hours=1.0, run=fake)  # must not raise
+
+
+def test_preflight_check_raises_when_quota_is_insufficient():
+    fake = FakeRun({("quota",): (0, QUOTA_STDOUT),
+                     ("kernels", "status", "alice/job-1"): (0, "status: complete")})
+    with pytest.raises(kaggle_ops.InsufficientQuotaError):
+        kaggle_ops.preflight_check("alice/job-1", required_hours=8.5, run=fake)
+
+
+def test_preflight_check_skips_the_quota_check_when_required_hours_is_none():
+    # No "quota" response registered -- if this were called, FakeRun's
+    # default (returncode 0, empty stdout) would make get_gpu_quota raise
+    # KaggleCommandError (no GPU row), so reaching the concurrency check
+    # cleanly proves the quota call was skipped.
+    fake = FakeRun({("kernels", "status", "alice/job-1"): (0, "status: complete")})
+    kaggle_ops.preflight_check("alice/job-1", required_hours=None, run=fake)  # must not raise
+
+
+@pytest.mark.parametrize("status", ["running", "queued"])
+def test_preflight_check_raises_on_an_already_running_or_queued_kernel(status):
+    fake = FakeRun({("kernels", "status", "alice/job-1"): (0, f"status: {status}")})
+    with pytest.raises(kaggle_ops.ConcurrentSessionError):
+        kaggle_ops.preflight_check("alice/job-1", required_hours=None, run=fake)
+
+
+def test_safe_push_kernel_pushes_when_the_preflight_check_passes(tmp_path):
+    fake = FakeRun({("kernels", "status", "alice/job-1"): (0, "status: complete")})
+    kaggle_ops.safe_push_kernel(tmp_path, "alice/job-1", required_hours=None, run=fake)
+    assert any("push" in c for c in fake.calls)
+
+
+def test_safe_push_kernel_does_not_push_when_the_preflight_check_fails(tmp_path):
+    fake = FakeRun({("kernels", "status", "alice/job-1"): (0, "status: running")})
+    with pytest.raises(kaggle_ops.ConcurrentSessionError):
+        kaggle_ops.safe_push_kernel(tmp_path, "alice/job-1", required_hours=None, run=fake)
+    assert not any("push" in c for c in fake.calls)
