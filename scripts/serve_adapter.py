@@ -263,6 +263,7 @@ def configure_state(profile: Profile, backend: str, args) -> None:
     S.STATE.backend = backend
     S.STATE.params_builder = simple_params_builder
     S.STATE.lora_request = None
+    S.STATE.lora_requests = {}
 
 
 def main(argv: list[str] | None = None) -> int:

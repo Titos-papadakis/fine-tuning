@@ -20,10 +20,11 @@ def compose(*hook_fns):
     on_response only guards the *whole* call, so without this a failure in
     the first composed hook would silently skip every hook after it."""
     def on_response(request, text, prompt_tokens, completion_tokens, elapsed_ms,
-                     customer_id=None):
+                     customer_id=None, cache_hit=False):
         for hook_fn in hook_fns:
             try:
-                hook_fn(request, text, prompt_tokens, completion_tokens, elapsed_ms, customer_id)
+                hook_fn(request, text, prompt_tokens, completion_tokens, elapsed_ms,
+                        customer_id, cache_hit)
             except Exception:                                          # noqa: BLE001
                 log.exception("one composed on_response hook failed; continuing with the rest")
 

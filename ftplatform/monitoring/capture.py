@@ -58,7 +58,7 @@ def build_hook(ctx):
     (or any other) can combine them with ftplatform.serving.hooks.compose()
     instead of the two stomping on ServerState.on_response in turn."""
     def on_response(request, text, prompt_tokens, completion_tokens, elapsed_ms,
-                     customer_id=None):
+                     customer_id=None, cache_hit=False):
         _write_row(ctx, request, text, prompt_tokens, completion_tokens, elapsed_ms)
     return on_response
 
@@ -99,7 +99,7 @@ def build_hook_shared(conn):
     ctx_cache: dict[str, object] = {}
 
     def on_response(request, text, prompt_tokens, completion_tokens, elapsed_ms,
-                     customer_id=None):
+                     customer_id=None, cache_hit=False):
         if customer_id is None:
             log.warning("production capture: no resolved customer_id for this request, "
                         "skipping rather than guessing where to log it")

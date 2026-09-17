@@ -43,16 +43,37 @@ def resolve_key(conn: sqlite3.Connection, plaintext_key: str) -> str | None:
     return row["customer_id"] if row else None
 
 
+MIN_REVOKE_PREFIX_LEN = 8
+
+
+class AmbiguousKeyPrefixError(ValueError):
+    pass
+
+
 def revoke_key(conn: sqlite3.Connection, key_hash_prefix: str) -> int:
     """Revokes every non-revoked key whose hash starts with
     `key_hash_prefix` (see list_keys() -- a caller only ever sees the hash,
     never the plaintext, so this is how a key gets identified for
     revocation). Returns how many keys were revoked; 0 means the prefix
-    matched nothing live, not necessarily an error."""
+    matched nothing live, not necessarily an error.
+
+    Refuses a prefix shorter than MIN_REVOKE_PREFIX_LEN -- in particular an
+    empty string, which would otherwise match (and revoke) every key for
+    every customer in one call. `%` and `_` in the prefix are escaped so
+    they match themselves literally rather than acting as SQL LIKE
+    wildcards, for the same reason: a key_hash is always hex and never
+    legitimately contains either, so only a mistaken/malicious prefix would
+    include one, and it should narrow the match, never broaden it."""
+    if len(key_hash_prefix) < MIN_REVOKE_PREFIX_LEN:
+        raise AmbiguousKeyPrefixError(
+            f"key_hash_prefix must be at least {MIN_REVOKE_PREFIX_LEN} characters "
+            f"(got {len(key_hash_prefix)!r}) -- too short a prefix risks revoking more "
+            f"keys than intended")
+    escaped = key_hash_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     cursor = conn.execute(
         "UPDATE api_keys SET revoked_at = ? "
-        "WHERE key_hash LIKE ? || '%' AND revoked_at IS NULL", (now, key_hash_prefix))
+        "WHERE key_hash LIKE ? || '%' ESCAPE '\\' AND revoked_at IS NULL", (now, escaped))
     conn.commit()
     return cursor.rowcount
 
@@ -68,18 +89,20 @@ def list_keys(conn: sqlite3.Connection, customer_id: str) -> list[dict]:
 
 def build_resolver(conn: sqlite3.Connection, customer_ids: set[str] | None = None):
     """A `(plaintext_key) -> customer_id | None` closure for
-    ftspec.serving.serve.STATE.api_key_resolver, snapshotting every active
-    key's hash at call time rather than querying sqlite on every request.
-    `customer_ids`, when given, restricts the snapshot to those customers
-    (e.g. only the ones actually registered on a shared server) -- a valid
-    key for a customer not being served here resolves to None, not a
-    surprising cross-deployment success."""
-    query = "SELECT key_hash, customer_id FROM api_keys WHERE revoked_at IS NULL"
-    rows = conn.execute(query).fetchall()
-    by_hash = {r["key_hash"]: r["customer_id"] for r in rows
-               if customer_ids is None or r["customer_id"] in customer_ids}
-
+    ftspec.serving.serve.STATE.api_key_resolver. Queries sqlite live on
+    every call rather than snapshotting once at build time -- a key
+    revoked (or created) after the server started takes effect on its very
+    next request. An earlier version snapshotted the active-key set once,
+    which meant revoking a leaked key had no effect on an already-running
+    server until it was restarted, defeating the point of an emergency
+    revocation. `customer_ids`, when given, restricts resolution to those
+    customers (e.g. only the ones actually registered on a shared server)
+    -- a valid key for a customer not being served here resolves to None,
+    not a surprising cross-deployment success."""
     def resolver(plaintext_key: str) -> str | None:
-        return by_hash.get(_hash(plaintext_key))
+        customer_id = resolve_key(conn, plaintext_key)
+        if customer_id is None or (customer_ids is not None and customer_id not in customer_ids):
+            return None
+        return customer_id
 
     return resolver

@@ -12,6 +12,7 @@ That last property is the entire reason this server exists rather than plain
 from __future__ import annotations
 
 import json
+import time
 import types
 from collections import OrderedDict
 
@@ -370,6 +371,22 @@ def test_nonzero_temperature_is_never_cached(cached_client):
     assert len(engine.calls) == 2
 
 
+def test_on_response_receives_an_explicit_cache_hit_flag(cached_client):
+    # cache_hit must come from serve.py's own bookkeeping, not be inferred
+    # by a hook from elapsed_ms == 0.0 -- a real (uncached) response could
+    # in principle also measure 0.0 and be miscounted as free.
+    c, _ = cached_client
+    seen = []
+    S.STATE.on_response = (lambda req, text, p, comp, ms, customer_id, cache_hit:
+                            seen.append(cache_hit))
+    try:
+        post(c)
+        post(c)
+    finally:
+        S.STATE.on_response = None
+    assert seen == [False, True]
+
+
 def test_cache_stats_are_reported_on_stats_and_health(cached_client):
     c, _ = cached_client
     post(c)
@@ -553,7 +570,8 @@ def test_cache_does_not_leak_between_customers_with_identical_requests(auth_mult
 def test_on_response_receives_the_resolved_customer_id(auth_client, monkeypatch):
     c, _ = auth_client
     received = []
-    S.STATE.on_response = lambda req, text, p, comp, ms, customer_id: received.append(customer_id)
+    S.STATE.on_response = (lambda req, text, p, comp, ms, customer_id, cache_hit:
+                            received.append(customer_id))
     _auth_post(c, key="key-a")
     assert received == ["acme"]
     S.STATE.on_response = None
@@ -600,6 +618,32 @@ def test_rate_limit_is_a_noop_without_auth(client):
     S.STATE.rate_limit_per_min = 0
 
 
+def test_check_rate_limit_prunes_long_expired_customer_entries():
+    # STATE.rate_window otherwise grows by one entry per distinct
+    # customer_id ever seen and never shrinks -- a slow leak on a
+    # long-lived server as customers churn.
+    S.STATE.rate_limit_per_min = 100
+    S.STATE.rate_window = {"long-gone": (time.time() - 200.0, 5)}
+    try:
+        S._check_rate_limit("someone-else")
+        assert "long-gone" not in S.STATE.rate_window
+        assert "someone-else" in S.STATE.rate_window
+    finally:
+        S.STATE.rate_limit_per_min = 0
+        S.STATE.rate_window = {}
+
+
+def test_check_rate_limit_keeps_a_still_fresh_customer_entry():
+    S.STATE.rate_limit_per_min = 100
+    S.STATE.rate_window = {"still-active": (time.time() - 5.0, 3)}
+    try:
+        S._check_rate_limit("someone-else")
+        assert "still-active" in S.STATE.rate_window
+    finally:
+        S.STATE.rate_limit_per_min = 0
+        S.STATE.rate_window = {}
+
+
 # --- streaming ---------------------------------------------------------------
 
 def test_streaming_emits_sse_chunks_and_terminates(client):
@@ -619,3 +663,42 @@ def test_streaming_emits_sse_chunks_and_terminates(client):
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
     reassembled = "".join(ch["choices"][0]["delta"].get("content", "") for ch in chunks)
     assert reassembled == SAMPLE_OUTPUT
+
+
+# --- load_engine's state reset (see _reset_state_for_load) -------------------
+# load_engine() itself imports transformers/vllm and can't run in a CPU-only
+# test; the reset logic it depends on is factored out specifically so it can
+# be exercised here without either installed.
+
+def test_reset_state_for_load_clears_stale_lora_registrations():
+    # A second load_engine() call in the same process (a future in-process
+    # hot-reload after a redeploy, say) must not leak a previous call's
+    # adapter registrations -- e.g. a customer removed from the roster
+    # should stop resolving, not keep serving their old adapter forever.
+    S.STATE.lora_requests = {"stale-customer": object()}
+    S.STATE.lora_request = object()
+
+    S._reset_state_for_load(cache_size=0, api_key_resolver=None, rate_limit_per_min=0)
+
+    assert S.STATE.lora_requests == {}
+    assert S.STATE.lora_request is None
+
+
+def test_reset_state_for_load_also_resets_cache_and_auth_state():
+    S.STATE.cache_max_size = 5
+    S.STATE.cache = OrderedDict({"stale": ("x", 1, 1)})
+    S.STATE.cache_hits = 3
+    S.STATE.cache_misses = 4
+    S.STATE.api_key_resolver = lambda k: "stale-customer"
+    S.STATE.rate_limit_per_min = 10
+    S.STATE.rate_window = {"stale-customer": (time.time(), 1)}
+
+    S._reset_state_for_load(cache_size=0, api_key_resolver=None, rate_limit_per_min=0)
+
+    assert S.STATE.cache_max_size == 0
+    assert S.STATE.cache == OrderedDict()
+    assert S.STATE.cache_hits == 0
+    assert S.STATE.cache_misses == 0
+    assert S.STATE.api_key_resolver is None
+    assert S.STATE.rate_limit_per_min == 0
+    assert S.STATE.rate_window == {}

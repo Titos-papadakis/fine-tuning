@@ -123,6 +123,22 @@ def test_result_shape_matches_what_the_response_path_reads():
     assert len(result.outputs[0].token_ids) == 4
 
 
+def test_configure_state_clears_stale_multi_adapter_registrations():
+    # A second configure_state() call in the same process must not leak a
+    # previous call's dict-mode lora_requests registrations -- see the
+    # identical concern for ftspec.serving.serve.load_engine().
+    from ftspec.core.registry import load_profile
+    from ftspec.serving import serve as S
+
+    S.STATE.lora_requests = {"stale-customer": object()}
+
+    profile = load_profile("saas_support")
+    args = serve_adapter.build_parser().parse_args(["--backend", "mock"])
+    serve_adapter.configure_state(profile, "mock", args)
+
+    assert S.STATE.lora_requests == {}
+
+
 # --- end to end through the real app -----------------------------------------
 
 @pytest.fixture

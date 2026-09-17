@@ -10,17 +10,26 @@ def test_compose_calls_every_hook(monkeypatch):
     hook_b = lambda *a: calls.append(("b", a))   # noqa: E731
 
     on_response = compose(hook_a, hook_b)
-    on_response("req", "text", 1, 2, 3.0, "acme")
+    on_response("req", "text", 1, 2, 3.0, "acme", True)
 
     assert [c[0] for c in calls] == ["a", "b"]
-    assert calls[0][1] == ("req", "text", 1, 2, 3.0, "acme")
+    assert calls[0][1] == ("req", "text", 1, 2, 3.0, "acme", True)
 
 
-def test_compose_passes_customer_id_through(monkeypatch):
+def test_compose_passes_customer_id_and_cache_hit_through(monkeypatch):
     seen = []
-    on_response = compose(lambda *a: seen.append(a[-1]))
-    on_response("req", "text", 1, 2, 3.0, "globex")
-    assert seen == ["globex"]
+    on_response = compose(lambda *a: seen.append(a[-2:]))
+    on_response("req", "text", 1, 2, 3.0, "globex", True)
+    assert seen == [("globex", True)]
+
+
+def test_compose_defaults_customer_id_and_cache_hit_when_omitted(monkeypatch):
+    # serve.py always passes both explicitly, but compose() itself should
+    # still behave sensibly for a caller that doesn't.
+    seen = []
+    on_response = compose(lambda *a: seen.append(a[-2:]))
+    on_response("req", "text", 1, 2, 3.0)
+    assert seen == [(None, False)]
 
 
 def test_compose_a_failing_hook_does_not_stop_the_rest(monkeypatch):
@@ -30,11 +39,11 @@ def test_compose_a_failing_hook_does_not_stop_the_rest(monkeypatch):
         raise RuntimeError("boom")
 
     on_response = compose(broken, lambda *a: calls.append("ran"))
-    on_response("req", "text", 1, 2, 3.0, None)  # must not raise
+    on_response("req", "text", 1, 2, 3.0, None, False)  # must not raise
 
     assert calls == ["ran"]
 
 
 def test_compose_with_no_hooks_is_a_harmless_noop():
     on_response = compose()
-    on_response("req", "text", 1, 2, 3.0, None)  # must not raise
+    on_response("req", "text", 1, 2, 3.0, None, False)  # must not raise

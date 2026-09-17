@@ -125,14 +125,19 @@ class ServerState:
     # list on a long-lived server is a slow memory leak.
     latencies_ms: deque = field(default_factory=lambda: deque(maxlen=512))
     # Optional: (request, text, prompt_tokens, completion_tokens, elapsed_ms,
-    # customer_id) -> None, called after every completed request.
+    # customer_id, cache_hit) -> None, called after every completed request.
     # customer_id is the auth-resolved identity (None when auth is off, or
     # for the streaming path before any auth was added -- accept it as an
-    # optional parameter, not a required one, for exactly that reason). None
-    # by default, so serving behaviour is unchanged unless something sets
-    # it -- this is how ftplatform.monitoring.capture / ftplatform.billing.usage
-    # attach without this module knowing either package exists.
-    on_response: Callable[[Any, str, int, int, float, str | None], None] | None = None
+    # optional parameter, not a required one, for exactly that reason).
+    # cache_hit is computed explicitly by generate_once() rather than left
+    # for a hook to infer from elapsed_ms == 0.0 (a fragile proxy: nothing
+    # stops a genuinely fast, non-cached response -- the mock backend has no
+    # artificial delay -- from also measuring 0.0 and being miscounted).
+    # None by default, so serving behaviour is unchanged unless something
+    # sets it -- this is how ftplatform.monitoring.capture /
+    # ftplatform.billing.usage attach without this module knowing either
+    # package exists.
+    on_response: Callable[[Any, str, int, int, float, str | None, bool], None] | None = None
     # Exact-match cache for non-streaming, temperature=0 requests (see
     # _cache_key() -- a request at any other temperature is never cached,
     # since caching would silently make sampling deterministic). 0 (the
@@ -269,10 +274,22 @@ def _check_rate_limit(customer_id: str | None) -> None:
     """No-op when rate limiting is off (rate_limit_per_min <= 0) or there is
     no authenticated identity to key it on. Fixed 60s windows, not a
     sliding log -- good enough to stop one noisy customer from starving
-    others on a shared engine, not a precise rate-limiting guarantee."""
+    others on a shared engine, not a precise rate-limiting guarantee.
+
+    Prunes any customer's entry whose window is well past expiry (2x the
+    window length) before doing anything else -- otherwise STATE.rate_window
+    grows by one entry per distinct customer_id ever seen and never shrinks,
+    a slow memory leak on a long-lived server as customers churn. Safe to
+    drop: an expired entry's state would be reset on that customer's next
+    request anyway, so pruning it early changes nothing observable."""
     if STATE.rate_limit_per_min <= 0 or customer_id is None:
         return
     now = time.time()
+    stale = [cid for cid, (window_start, _) in STATE.rate_window.items()
+             if now - window_start >= 120.0]
+    for cid in stale:
+        del STATE.rate_window[cid]
+
     window_start, count = STATE.rate_window.get(customer_id, (now, 0))
     if now - window_start >= 60.0:
         window_start, count = now, 0
@@ -313,7 +330,8 @@ def _cache_key(req: ChatCompletionRequest, customer_id: str | None = None) -> st
 
 def _record_response(req: ChatCompletionRequest, text: str, prompt_tokens: int,
                       completion_tokens: int, elapsed_ms: float, constrained: bool,
-                      request_id: str, customer_id: str | None) -> None:
+                      request_id: str, customer_id: str | None,
+                      cache_hit: bool = False) -> None:
     STATE.served_requests += 1
     STATE.latencies_ms.append(elapsed_ms)
     if constrained:
@@ -323,7 +341,7 @@ def _record_response(req: ChatCompletionRequest, text: str, prompt_tokens: int,
     if STATE.on_response is not None:
         try:
             STATE.on_response(req, text, prompt_tokens, completion_tokens, elapsed_ms,
-                               customer_id)
+                               customer_id, cache_hit)
         except Exception:                                             # noqa: BLE001
             # A side-channel observer (production-traffic capture, usage
             # metering, say) must never take an actual served response down
@@ -366,7 +384,7 @@ async def generate_once(req: ChatCompletionRequest,
         STATE.cache.move_to_end(cache_key)
         text, prompt_tokens, completion_tokens = STATE.cache[cache_key]
         _record_response(req, text, prompt_tokens, completion_tokens, 0.0, constrained,
-                          request_id, customer_id)
+                          request_id, customer_id, cache_hit=True)
         return text, prompt_tokens, completion_tokens
     if cache_key is not None:
         STATE.cache_misses += 1
@@ -578,13 +596,42 @@ def create_app(respect_client_system_prompt: bool = False):
                     # Streaming never computes prompt/completion token counts
                     # today (only generate_once's non-streaming path does) --
                     # 0 here is an honest "not measured", not an estimate.
-                    STATE.on_response(req, text, 0, 0, elapsed_ms, customer_id)
+                    # cache_hit is always False here -- the cache only exists
+                    # for generate_once()'s non-streaming path.
+                    STATE.on_response(req, text, 0, 0, elapsed_ms, customer_id, False)
                 except Exception:                                     # noqa: BLE001
                     log.exception("on_response hook failed; the stream itself was unaffected")
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     return app
+
+
+def _reset_state_for_load(cache_size: int, api_key_resolver: Callable[[str], str | None] | None,
+                           rate_limit_per_min: int) -> None:
+    """Every piece of ServerState a fresh load_engine() call should start
+    clean from -- factored out of load_engine() itself (which imports
+    transformers/vllm and so can't be called in a CPU-only test) so this
+    reset behavior is directly testable.
+
+    Clears STATE.lora_requests/lora_request unconditionally, not just
+    overwrites them with what a caller goes on to register: a bare `lora`
+    (single-adapter or None) must leave these at their reset value rather
+    than inheriting a dict-mode registration left over from an earlier call
+    in the same process, and vice versa. Without this, a second
+    load_engine() call (a future in-process hot-reload after a redeploy,
+    say) would leak stale adapter registrations -- e.g. a customer removed
+    from the roster would keep resolving to their old adapter path forever.
+    """
+    STATE.cache_max_size = cache_size
+    STATE.cache = OrderedDict()
+    STATE.cache_hits = 0
+    STATE.cache_misses = 0
+    STATE.api_key_resolver = api_key_resolver
+    STATE.rate_limit_per_min = rate_limit_per_min
+    STATE.rate_window = {}
+    STATE.lora_requests = {}
+    STATE.lora_request = None
 
 
 def load_engine(model: str, profile: Profile, lora: str | dict[str, str] | None,
@@ -621,13 +668,7 @@ def load_engine(model: str, profile: Profile, lora: str | dict[str, str] | None,
     from transformers import AutoTokenizer
     from vllm import AsyncEngineArgs, AsyncLLMEngine
 
-    STATE.cache_max_size = cache_size
-    STATE.cache = OrderedDict()
-    STATE.cache_hits = 0
-    STATE.cache_misses = 0
-    STATE.api_key_resolver = api_key_resolver
-    STATE.rate_limit_per_min = rate_limit_per_min
-    STATE.rate_window = {}
+    _reset_state_for_load(cache_size, api_key_resolver, rate_limit_per_min)
     STATE.profile = profile
     STATE.schema = profile.contract.json_schema()
     STATE.system_prompt = profile.prompts.short

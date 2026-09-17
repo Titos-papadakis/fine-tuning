@@ -68,6 +68,27 @@ def test_revoke_key_accepts_a_hash_prefix(conn):
     assert keys.revoke_key(conn, key_hash[:12]) == 1
 
 
+def test_revoke_key_refuses_a_prefix_shorter_than_the_minimum(conn):
+    # An empty (or too-short) prefix would otherwise match -- and revoke --
+    # every active key for every customer in one call.
+    key = keys.create_key(conn, "acme")
+    with pytest.raises(keys.AmbiguousKeyPrefixError):
+        keys.revoke_key(conn, "")
+    with pytest.raises(keys.AmbiguousKeyPrefixError):
+        keys.revoke_key(conn, "short")
+    assert keys.resolve_key(conn, key) == "acme"  # nothing was revoked
+
+
+def test_revoke_key_treats_percent_as_a_literal_character_not_a_wildcard(conn):
+    key = keys.create_key(conn, "acme")
+    real_hash = conn.execute("SELECT key_hash FROM api_keys").fetchone()["key_hash"]
+    # Not a real prefix of real_hash -- an unescaped LIKE would still treat
+    # '%' as "any characters" and could accidentally match this key anyway.
+    fake_prefix = real_hash[:6] + "%" + real_hash[8:10]
+    assert keys.revoke_key(conn, fake_prefix) == 0
+    assert keys.resolve_key(conn, key) == "acme"  # unaffected
+
+
 def test_list_keys_never_exposes_plaintext(conn):
     key = keys.create_key(conn, "acme", label="prod")
     rows = keys.list_keys(conn, "acme")
@@ -104,6 +125,26 @@ def test_build_resolver_excludes_revoked_keys(conn):
     keys.revoke_key(conn, key_hash)
     resolver = keys.build_resolver(conn)
     assert resolver(key) is None
+
+
+def test_build_resolver_reflects_a_revocation_without_rebuilding(conn):
+    # Regression test: an earlier version snapshotted the active-key set
+    # once at build_resolver() time, so a key revoked afterward kept
+    # resolving on an already-running server until it was restarted.
+    key = keys.create_key(conn, "acme")
+    resolver = keys.build_resolver(conn)
+    assert resolver(key) == "acme"
+
+    key_hash = conn.execute("SELECT key_hash FROM api_keys").fetchone()["key_hash"]
+    keys.revoke_key(conn, key_hash)
+
+    assert resolver(key) is None  # same resolver instance, never rebuilt
+
+
+def test_build_resolver_reflects_a_newly_created_key_without_rebuilding(conn):
+    resolver = keys.build_resolver(conn)
+    key = keys.create_key(conn, "acme")  # created after the resolver was built
+    assert resolver(key) == "acme"
 
 
 # --- usage -----------------------------------------------------------------
@@ -197,7 +238,17 @@ def test_build_hook_skips_requests_with_no_resolved_customer(conn):
     assert usage.report_all(conn) == []
 
 
-def test_build_hook_treats_zero_elapsed_ms_as_a_cache_hit(conn):
+def test_build_hook_records_a_cache_hit_when_explicitly_flagged(conn):
     hook = usage.build_hook(conn)
-    hook(_FakeRequest(), "output text", 100, 50, 0.0, "acme")
+    hook(_FakeRequest(), "output text", 100, 50, 12.0, "acme", cache_hit=True)
     assert usage.report(conn, "acme")["cache_hits"] == 1
+
+
+def test_build_hook_does_not_infer_a_cache_hit_from_zero_elapsed_ms(conn):
+    # Regression test: this used to be the only signal available (elapsed_ms
+    # == 0.0), which would have miscounted a genuinely fast but real
+    # (non-cached) response as free. cache_hit is now serve.py's own
+    # explicit signal, computed where the cache lookup actually happens.
+    hook = usage.build_hook(conn)
+    hook(_FakeRequest(), "output text", 100, 50, 0.0, "acme", cache_hit=False)
+    assert usage.report(conn, "acme")["cache_hits"] == 0

@@ -59,13 +59,16 @@ def build_hook(conn: sqlite3.Connection):
     ftplatform.serving.hooks.compose() for running both) that records usage
     against the auth-resolved customer_id. A request with no resolved
     customer_id (auth disabled) is not recorded -- there is no customer to
-    bill it against. generate_once()'s cache-hit path always reports
-    elapsed_ms=0.0 (see serve.py), which is how a cache hit is distinguished
-    here without serve.py needing to know usage_counters exists."""
+    bill it against. `cache_hit` is serve.py's own explicit signal (computed
+    where the cache lookup happens, in generate_once()) rather than inferred
+    here from elapsed_ms == 0.0 -- that used to be the only signal available,
+    but a genuinely fast, non-cached response (nothing stops one, e.g. from a
+    trivial mock backend with no artificial delay) could also measure 0.0
+    and be miscounted as free."""
     def on_response(request, text, prompt_tokens, completion_tokens, elapsed_ms,
-                     customer_id=None):
+                     customer_id=None, cache_hit=False):
         if customer_id is None:
             return
-        record(conn, customer_id, prompt_tokens, completion_tokens, cache_hit=elapsed_ms == 0.0)
+        record(conn, customer_id, prompt_tokens, completion_tokens, cache_hit=cache_hit)
 
     return on_response
