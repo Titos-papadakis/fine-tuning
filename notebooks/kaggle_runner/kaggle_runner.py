@@ -108,8 +108,14 @@ run(["ftspec", "audit", "--profile", PROFILE], cwd=CLONE_DIR)
 run(["ftspec", "validate", "--profile", PROFILE], cwd=CLONE_DIR)
 
 step("4 . Train")
+# --config no_merge.yaml: skip the default 16-bit merged-model save. It costs
+# real GPU minutes to dequantize+write (~16GB for an 8B model) and this run
+# doesn't use it -- evaluate below reads the LoRA adapter directly, and
+# production serving is vLLM's LoRA loading, not a merged checkpoint. Left
+# on, a prior run's output download dragged in that ~16GB for nothing.
 started = time.time()
-run(["ftspec", "train", "--profile", PROFILE, "--max-steps", str(MAX_STEPS)], cwd=CLONE_DIR)
+run(["ftspec", "train", "--profile", PROFILE, "--max-steps", str(MAX_STEPS),
+     "--config", "notebooks/kaggle_runner/no_merge.yaml"], cwd=CLONE_DIR)
 print(f"training wall clock: {(time.time() - started) / 60:.1f} min")
 
 step("5 . Benchmark matrix -- one process per system, on purpose")
@@ -179,13 +185,15 @@ if readme_path.exists():
 step("9 . Strip bulk that isn't worth downloading, before Kaggle snapshots /kaggle/working")
 # .git (a full clone, not needed once the code is installed), intermediate
 # training checkpoints (full optimizer state per checkpoint -- only the
-# final lora_adapter/ matters once training succeeded), and the HF download
-# cache under merged_model/ all inflate this run's output for no benefit,
-# and are the leading suspect for why reports/ didn't make it into the
-# previous sanity-check run's download.
+# final lora_adapter/ matters once training succeeded), and merged_model/
+# (the ~16GB dequantized 16-bit merge -- step 4 now skips saving it via
+# --config no_merge.yaml, so this is a safety net for a run without that
+# flag, not the primary fix) all inflate this run's output for no benefit,
+# and are leading suspects for why reports/ didn't make it into the
+# original sanity-check run's download.
 shutil.rmtree(CLONE_DIR / ".git", ignore_errors=True)
 shutil.rmtree(CLONE_DIR / "outputs" / PROFILE / "checkpoints", ignore_errors=True)
-shutil.rmtree(CLONE_DIR / "outputs" / PROFILE / "merged_model" / ".cache", ignore_errors=True)
+shutil.rmtree(CLONE_DIR / "outputs" / PROFILE / "merged_model", ignore_errors=True)
 
 print("\nDONE -- artifacts in", out)
 for p in sorted(out.rglob("*")):

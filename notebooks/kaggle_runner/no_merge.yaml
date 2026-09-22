@@ -1,0 +1,11 @@
+# Override for the automated Kaggle baseline runner (kaggle_runner.py) only.
+#
+# `ftspec train` saves a merged 16-bit model by default (merge.save_merged_16bit),
+# meant for later `ftspec serve --model outputs/merged_model` convenience. This
+# run doesn't need it: `ftspec evaluate` runs from the LoRA adapter directly, and
+# production serving here is vLLM's LoRA loading (see ftspec/serving/serve.py),
+# not a merged checkpoint. Left enabled, the merge costs real GPU minutes to
+# dequantize+write an ~16GB file, and then ~16GB of otherwise-pointless download
+# bandwidth every time this kernel's output is pulled.
+merge:
+  save_merged_16bit: false
