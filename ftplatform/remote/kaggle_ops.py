@@ -172,11 +172,21 @@ def safe_push_kernel(kernel_dir: Path, kernel_id: str, required_hours: float | N
 def _parse_kernel_status(raw_stdout: str) -> str:
     """Best-effort: see this module's docstring. Falls back to "running" for
     anything unrecognized rather than raising, so a wording change on
-    Kaggle's side degrades to "keep polling" instead of crashing the loop."""
+    Kaggle's side degrades to "keep polling" instead of crashing the loop.
+
+    Confirmed against a real account: Kaggle's actual wording is
+    "KernelWorkerStatus.CANCEL_ACKNOWLEDGED", not "cancelled"/"cancelling" --
+    neither matched, so this used to fall back to "running" and (with
+    preflight_check() added later) wrongly refuse to push over a kernel that
+    had, in fact, already stopped. The "cancel" catch-all below covers this
+    and any other CANCEL_* wording the same way.
+    """
     text = raw_stdout.lower()
     for status in ("error", "cancelled", "cancelling", "complete", "running", "queued"):
         if status in text:
             return status
+    if "cancel" in text:
+        return "cancelled"
     return "running"
 
 

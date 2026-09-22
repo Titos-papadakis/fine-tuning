@@ -97,6 +97,11 @@ def test_push_kernel_invokes_kernels_push(tmp_path):
     ("Kernel has status \"queued\"", "queued"),
     ("Kernel has status \"error\"", "error"),
     ("Kernel has status \"cancelled\"", "cancelled"),
+    # Kaggle's real wording (confirmed against a live account) -- neither
+    # "cancelled" nor "cancelling" matches this, so it used to fall back to
+    # "running" and wrongly block preflight_check() from pushing over a
+    # kernel that had, in fact, already stopped.
+    ("titospapadak/foo has status \"KernelWorkerStatus.CANCEL_ACKNOWLEDGED\"", "cancelled"),
     ("something unrecognized entirely", "running"),
 ])
 def test_parse_kernel_status(stdout, expected):
