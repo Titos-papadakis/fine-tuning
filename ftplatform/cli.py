@@ -925,7 +925,7 @@ def kaggle_start(
                                       default_work_dir(job_id), required_hours=required_hours)
     except (kaggle_ops.InsufficientQuotaError, kaggle_ops.ConcurrentSessionError) as e:
         typer.secho(f"refusing to push: {e}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
     finally:
         conn.close()
     typer.secho(f"\npushed kernel {result['kernel_id']!r} for job {job_id!r}.",
@@ -965,7 +965,7 @@ def kaggle_push(
         kaggle_ops.safe_push_kernel(kernel_dir, kernel_id, required_hours)
     except (kaggle_ops.InsufficientQuotaError, kaggle_ops.ConcurrentSessionError) as e:
         typer.secho(f"refusing to push: {e}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
     typer.secho(f"pushed {kernel_id!r} from {kernel_dir}", fg=typer.colors.GREEN)
 
 
@@ -1232,6 +1232,85 @@ def usage_report_all(
     for r in rows:
         typer.echo(f"  {r['customer_id']:<16} {r['requests']:>9} {r['prompt_tokens']:>11} "
                     f"{r['completion_tokens']:>15} {r['cache_hits']:>11}")
+    typer.echo("")
+
+
+# --- Stripe: whether a customer is an actual paying subscriber ---------------
+# Separate from usage report/report-all above (what they consumed) -- this is
+# whether money is actually changing hands. Requires `pip install ftspec[billing]`
+# (the `stripe` package) for stripe-link/stripe-subscribe/stripe-status, which
+# talk to a real Stripe account; nothing else in ftplatform needs it.
+
+@usage_app.command("stripe-link")
+def usage_stripe_link(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    email: str = typer.Option(..., help="Billing contact email for the Stripe customer."),
+    name: str = typer.Option(..., help="Display name for the Stripe customer."),
+):
+    """Create a Stripe customer for CUSTOMER_ID and record the link --
+    the step before `stripe-subscribe`. Safe to re-run; updates in place."""
+    from ftplatform.billing import stripe_billing as sb
+
+    conn = connect()
+    try:
+        stripe_customer_id = sb.create_stripe_customer(customer_id, email, name)
+        sb.link_customer(conn, customer_id, email, stripe_customer_id)
+        status = sb.billing_status(conn, customer_id)
+    finally:
+        conn.close()
+    typer.secho(f"\n{customer_id} linked to Stripe customer {status['stripe_customer_id']!r}.",
+                fg=typer.colors.GREEN)
+
+
+@usage_app.command("stripe-subscribe")
+def usage_stripe_subscribe(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    price: str = typer.Option(..., help="Stripe Price id for the flat monthly fee "
+                                          "(created once, by hand, in the Stripe dashboard)."),
+):
+    """Subscribe an already-`stripe-link`ed customer to PRICE. This is the
+    call that actually starts charging them."""
+    from ftplatform.billing import stripe_billing as sb
+
+    conn = connect()
+    try:
+        account = sb.billing_status(conn, customer_id)
+        if account["stripe_customer_id"] is None:
+            typer.secho(f"{customer_id} has no Stripe customer yet -- run "
+                        f"`ftplatform usage stripe-link {customer_id} --email ... --name ...` "
+                        f"first.", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        stripe_subscription_id = sb.create_subscription(account["stripe_customer_id"], price)
+        status = sb.fetch_subscription_status(stripe_subscription_id)
+        sb.record_subscription(conn, customer_id, stripe_subscription_id, status)
+        result = sb.billing_status(conn, customer_id)
+    finally:
+        conn.close()
+    color = typer.colors.GREEN if result["status"] == "active" else typer.colors.YELLOW
+    typer.secho(f"\n{customer_id} subscribed -> status {result['status']!r}.", fg=color)
+
+
+@usage_app.command("stripe-status")
+def usage_stripe_status(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    refresh: bool = typer.Option(False, help="Re-check Stripe for the latest status "
+                                              "instead of showing the last-known one."),
+):
+    """This customer's billing status: unlinked, linked, or a live Stripe
+    subscription status (active, past_due, canceled, ...)."""
+    from ftplatform.billing import stripe_billing as sb
+
+    conn = connect()
+    try:
+        status = (sb.refresh_subscription_status(conn, customer_id) if refresh
+                   else sb.billing_status(conn, customer_id))
+    finally:
+        conn.close()
+    typer.echo(f"\n{customer_id}: {status['status']}")
+    if status["stripe_customer_id"]:
+        typer.echo(f"  stripe customer:     {status['stripe_customer_id']}")
+    if status["stripe_subscription_id"]:
+        typer.echo(f"  stripe subscription: {status['stripe_subscription_id']}")
     typer.echo("")
 
 

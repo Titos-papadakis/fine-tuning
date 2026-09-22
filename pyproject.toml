@@ -47,6 +47,9 @@ constrained = [
 openai = [
     "openai>=1.40.0",
 ]
+billing = [
+    "stripe>=10.0",
+]
 custom = [
     # Needed only for `--profile custom`, which validates against a raw
     # JSON Schema rather than a Pydantic model.
@@ -76,6 +79,7 @@ ignore = ["E501"]
 # Typer declares options as function-call defaults; that is its documented API,
 # not an accident. Scoped to the CLI so genuine B008 elsewhere still surfaces.
 "ftspec/cli.py" = ["B008"]
+"ftplatform/cli.py" = ["B008"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

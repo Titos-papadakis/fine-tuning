@@ -113,6 +113,23 @@ CREATE TABLE IF NOT EXISTS usage_counters (
     cache_hits          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (customer_id, period)
 );
+
+-- One row per customer that has been linked to Stripe -- created the moment
+-- a customer is ready to actually be charged, not at `customer add` time (a
+-- customer can exist and be trained/evaluated for a good while before any
+-- money changes hands). Never holds card/payment details -- that stays in
+-- Stripe; this is only enough to know who a customer is over there and
+-- whether their subscription is currently active. status mirrors Stripe's
+-- own subscription status vocabulary ('active', 'past_due', 'canceled', ...)
+-- plus 'unlinked'/'linked' for the two states before a subscription exists.
+CREATE TABLE IF NOT EXISTS billing_accounts (
+    customer_id             TEXT PRIMARY KEY REFERENCES customers(id),
+    email                   TEXT NOT NULL,
+    stripe_customer_id      TEXT,
+    stripe_subscription_id  TEXT,
+    status                  TEXT NOT NULL DEFAULT 'unlinked',
+    updated_at              TEXT NOT NULL
+);
 """
 
 
