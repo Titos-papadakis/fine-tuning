@@ -138,15 +138,15 @@ RESOLUTION_LINES = {
 ISSUE_TEMPLATES: dict[str, list] = {
     # billing
     "duplicate_charge": [
-        ("I was charged twice for my {product} subscription, order {order_id}. My plan is only ${plan_amount} a month but ${amount} came out in total.",
+        ("I was charged twice for my {product} subscription, order {order_id} — two separate ${plan_amount} charges landed on the same card this week, ${amount} in total.",
          "Agent: I can see two identical charges on your account, let me pull up the transaction log."),
-        ("There are two {product} charges on my card for order {order_id} — I should have paid ${plan_amount}, not ${amount}.",
+        ("There are two identical {product} charges on my card for order {order_id}, back to back — ${plan_amount} each, ${amount} altogether.",
          "Agent: Let me check the transaction history for that order."),
     ],
     "incorrect_invoice": [
-        ("My latest invoice for {product} shows ${amount} but my plan is supposed to be ${plan_amount}.",
+        ("My latest {product} invoice has one line item but the number on it is wrong: it shows ${amount} when my plan rate is ${plan_amount}.",
          "Agent: Let me check your billing history and current plan tier."),
-        ("The {product} invoice I just received says ${amount}. That's not the ${plan_amount} we agreed on.",
+        ("The single {product} invoice I just received lists ${amount}. That's not the ${plan_amount} rate we agreed on — the invoice itself has the wrong figure.",
          "Agent: I'll compare that against your contracted rate."),
     ],
     "subscription_renewal": [
@@ -231,15 +231,15 @@ ISSUE_TEMPLATES: dict[str, list] = {
     ],
     # account
     "password_reset": [
-        ("I never received the password reset email for my {product} account.",
+        ("I never received the password reset email for my {product} account — the inbox is just empty, no message at all.",
          "Agent: Let me check if the email is being blocked or delayed."),
-        ("The {product} reset link never arrives, I've requested it six times.",
+        ("The {product} reset link never arrives in my inbox, I've requested it six times and nothing shows up.",
          "Agent: I'll check our mail delivery logs for your address."),
     ],
     "account_locked": [
-        ("My {product} account got locked after a few failed login attempts and I need it back.",
+        ("My {product} account shows a 'locked' notice after a few failed login attempts and I need it unlocked.",
          "Agent: I can help unlock that, let me verify your identity first."),
-        ("I'm locked out of {product} entirely and can't get any work done.",
+        ("I'm getting an explicit account-locked message on {product} and can't get any work done until it's lifted.",
          "Agent: Let me confirm a couple of details so I can lift the lock."),
     ],
     "email_change": [
@@ -262,9 +262,9 @@ ISSUE_TEMPLATES: dict[str, list] = {
     ],
     # product
     "missing_feature": [
-        ("Does {product} support exporting reports to Excel? I can't find that option.",
+        ("Does {product} support exporting reports to Excel? I've looked everywhere in the settings and can't find that option — does it just not exist?",
          "Agent: Let me check the current feature set and any workarounds."),
-        ("Is there a way to bulk export from {product}? I've looked everywhere.",
+        ("Is there a way to bulk export from {product}? I've searched the whole interface and it doesn't seem to be there at all.",
          "Agent: I'll confirm what export options are available on your plan."),
     ],
     "how_to_use": [
@@ -286,9 +286,9 @@ ISSUE_TEMPLATES: dict[str, list] = {
          "Agent: Let me get engineering to look at that discrepancy."),
     ],
     "feature_request": [
-        ("It would be great if {product} supported dark mode, is that on the roadmap?",
+        ("I know {product} doesn't have dark mode today, but it would be great if you added it — is that on the roadmap?",
          "Agent: Thanks for the suggestion, I'll log that as a feature request."),
-        ("Any chance {product} could add scheduled reports? It'd save us hours.",
+        ("Could you build scheduled reports into {product}? I understand it's not there yet, just suggesting it — it'd save us hours.",
          "Agent: That's a fair ask, let me record it for the product team."),
     ],
     # refund
@@ -305,9 +305,9 @@ ISSUE_TEMPLATES: dict[str, list] = {
          "Agent: I'll chase that refund with our payments team."),
     ],
     "partial_refund": [
-        ("I only got ${plan_amount} back but I was owed ${amount} for order {order_id}.",
+        ("I did receive a refund for order {order_id}, but only ${plan_amount} landed when I was owed the full ${amount} — it's short, not missing.",
          "Agent: Let me look into the breakdown of that refund."),
-        ("The refund on order {order_id} was short — ${plan_amount} arrived instead of ${amount}.",
+        ("A refund for order {order_id} arrived, but the amount was short — ${plan_amount} came in instead of the full ${amount}.",
          "Agent: I'll reconcile that refund amount for you."),
     ],
     "warranty_claim": [
@@ -317,9 +317,9 @@ ISSUE_TEMPLATES: dict[str, list] = {
          "Agent: That's within warranty, let me open a claim."),
     ],
     "cancellation_refund": [
-        ("I cancelled my {product} order {order_id} but haven't seen the ${amount} refund yet.",
+        ("I cancelled my {product} order {order_id} and nothing has come back at all — zero refund of the ${amount}, not even a partial amount.",
          "Agent: Let me confirm the cancellation and refund timeline for you."),
-        ("Order {order_id} was cancelled weeks ago and the ${amount} still hasn't come back.",
+        ("Order {order_id} was cancelled weeks ago and I haven't received a cent of the ${amount} refund yet.",
          "Agent: I'll verify the cancellation went through properly."),
     ],
     # other
