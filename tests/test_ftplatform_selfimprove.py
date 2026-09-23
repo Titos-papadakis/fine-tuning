@@ -206,3 +206,66 @@ def test_run_cycle_trains_and_deploys_when_gates_pass(monkeypatch, customer_ctx,
     assert result["folded"]["added"] == 1
     assert result["candidate_id"] in trained_ids
     assert result["deployed"] is True
+
+
+# --- CLI wiring: rejected corrections must be visible, not silently dropped ---
+# Regression coverage for a real bug: fold_corrections() always returned
+# `rejected`/`rejected_reasons`, but the CLI only ever printed `added` and
+# the generic "no corrections to fold" message -- identical output whether
+# nothing was submitted or everything submitted failed validation and was
+# archived unfolded. A human reviewer's work could vanish with no visible
+# signal.
+
+def _invoke_selfimprove_run(customer_id="acme"):
+    from typer.testing import CliRunner
+
+    from ftplatform.cli import app
+    return CliRunner().invoke(app, ["selfimprove", "run", customer_id,
+                                      "--base-model", "org/model",
+                                      "--lora-r", "16", "--lora-alpha", "16"])
+
+
+def test_cli_reports_when_every_correction_is_rejected(monkeypatch, tmp_path, conn):
+    import ftplatform.db as db_mod
+
+    # REPO_ROOT (and DB_PATH, for the CLI's own connect()) must be patched
+    # before anything resolves a path against them -- CustomerContext.
+    # memory_dir() reads the module-level REPO_ROOT at call time, so
+    # constructing it (or writing through it) before patching would resolve
+    # against the *real* repo instead of tmp_path.
+    monkeypatch.setattr(config_mod, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(db_mod, "DB_PATH", tmp_path / "customers.db")
+
+    store.create(conn, "acme", "Acme Inc", "saas_support")
+    ctx = CustomerContext(conn, "acme")
+    ctx.memory_dir().mkdir(parents=True, exist_ok=True)
+    bad_record = {"ticket_summary": "missing everything else"}
+    with open(ctx.memory_dir() / "corrections.jsonl", "w", encoding="utf-8") as f:
+        f.write(json.dumps({"input": "a transcript", "output": bad_record}) + "\n")
+    conn.commit()
+
+    result = _invoke_selfimprove_run()
+
+    assert result.exit_code == 0
+    combined = result.stdout + result.stderr
+    # The old, ambiguous message must not be the *only* thing shown here --
+    # that's exactly what made a fully-rejected batch indistinguishable from
+    # nothing having been submitted at all.
+    assert "1 correction(s) all FAILED" in combined
+
+
+def test_cli_genuinely_nothing_to_fold_still_says_so_plainly(monkeypatch, tmp_path, conn):
+    import ftplatform.db as db_mod
+
+    monkeypatch.setattr(config_mod, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(db_mod, "DB_PATH", tmp_path / "customers.db")
+
+    store.create(conn, "acme", "Acme Inc", "saas_support")
+    conn.commit()
+
+    result = _invoke_selfimprove_run()
+
+    assert result.exit_code == 0
+    combined = result.stdout + result.stderr
+    assert "no corrections to fold" in combined
+    assert "FAILED validation" not in combined

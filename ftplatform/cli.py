@@ -771,16 +771,35 @@ def selfimprove_run(
     finally:
         conn.close()
 
+    folded = result["folded"]
     if result["candidate_id"] is None:
-        typer.echo(f"\n{result['reason']}")
+        if folded["rejected"]:
+            # Distinct from "nothing submitted" -- every pending correction
+            # failed contract validation and was archived unfolded. Silently
+            # printing the same "no corrections to fold" message here would
+            # hide that a human's review work was just discarded.
+            typer.secho(f"\n{folded['rejected']} correction(s) all FAILED validation and were "
+                        f"archived without training -- nothing was silently lost, but nothing "
+                        f"was folded either:", fg=typer.colors.RED, err=True)
+            for reason in folded["rejected_reasons"]:
+                typer.echo(f"  - {reason}")
+        else:
+            typer.echo(f"\n{result['reason']}")
     elif result["deployed"]:
         typer.secho(f"\nretrained candidate {result['candidate_id']!r} "
-                     f"({result['folded']['added']} correction(s) folded) -- PROMOTED.",
+                     f"({folded['added']} correction(s) folded) -- PROMOTED.",
                      fg=typer.colors.GREEN)
     else:
         typer.secho(f"\nretrained candidate {result['candidate_id']!r} "
-                     f"({result['folded']['added']} correction(s) folded) -- "
+                     f"({folded['added']} correction(s) folded) -- "
                      f"NOT promoted: {result['reason']}", fg=typer.colors.YELLOW)
+    if folded["rejected"] and result["candidate_id"] is not None:
+        # Some corrections were folded, but not all -- worth surfacing even
+        # on a path that otherwise looks successful.
+        typer.secho(f"\n({folded['rejected']} other correction(s) failed validation and were "
+                    f"archived unfolded)", fg=typer.colors.YELLOW)
+        for reason in folded["rejected_reasons"]:
+            typer.echo(f"  - {reason}")
 
 
 @app.command("approve")
