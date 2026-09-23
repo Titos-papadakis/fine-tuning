@@ -62,6 +62,8 @@ apikey_app = typer.Typer(help="API keys for the serving layer.", no_args_is_help
 app.add_typer(apikey_app, name="api-key")
 usage_app = typer.Typer(help="Per-customer usage/billing counters.", no_args_is_help=True)
 app.add_typer(usage_app, name="usage")
+db_app = typer.Typer(help="The platform database itself (customers.db).", no_args_is_help=True)
+app.add_typer(db_app, name="db")
 
 log = get_logger("ftplatform.cli")
 
@@ -1312,6 +1314,32 @@ def usage_stripe_status(
     if status["stripe_subscription_id"]:
         typer.echo(f"  stripe subscription: {status['stripe_subscription_id']}")
     typer.echo("")
+
+
+@db_app.command("backup")
+def db_backup(
+    out: Path = typer.Option(
+        None, help="Destination file. Defaults to backups/customers-<timestamp>.db "
+                     "next to the live database."),
+):
+    """Consistent snapshot of customers.db -- every customer's metadata,
+    deployments, API keys (hashed), usage counters and billing status.
+    Never includes raw customer text, corpora, or model weights -- those
+    live under customers/<id>/ on disk, not in this database (see
+    ftplatform/db.py's module docstring)."""
+    from datetime import datetime, timezone
+
+    from ftplatform.db import DB_PATH
+    from ftplatform.db import backup as db_backup_fn
+
+    dest = out or (DB_PATH.parent / "backups" /
+                    f"customers-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.db")
+    conn = connect()
+    try:
+        written = db_backup_fn(conn, dest)
+    finally:
+        conn.close()
+    typer.secho(f"\nbacked up -> {written}", fg=typer.colors.GREEN)
 
 
 if __name__ == "__main__":

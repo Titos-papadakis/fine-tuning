@@ -140,3 +140,21 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def backup(conn: sqlite3.Connection, dest_path: Path) -> Path:
+    """Consistent snapshot of the whole platform database to `dest_path`.
+
+    Uses sqlite3's own online backup API rather than copying the file --
+    this database runs in WAL mode (see the module docstring) specifically
+    so reads/writes aren't blocked, which means a plain file copy can catch
+    it mid-write and produce a corrupt snapshot. The backup API takes a
+    consistent snapshot regardless of what's concurrently writing."""
+    dest_path = Path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_conn = sqlite3.connect(dest_path)
+    try:
+        conn.backup(dest_conn)
+    finally:
+        dest_conn.close()
+    return dest_path
