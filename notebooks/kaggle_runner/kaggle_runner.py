@@ -46,13 +46,18 @@ GPU_COST_PER_HOUR = "0.35"
 N_TRAIN = 10000
 N_VAL = 500
 N_EVAL = 150
-EVAL_SYSTEMS = ("finetuned", "finetuned-constrained", "base-constrained", "base-rubric")
+# finetuned-constrained scored identically to finetuned on the last run (same
+# 87.3%, McNemar p=1.0) and base-rubric identically to base-constrained on
+# record exact (0.0%) -- ~0.5h of GPU each for no new information.
+EVAL_SYSTEMS = ("finetuned", "base-constrained")
 # Kaggle GPU sessions cap out around 12h. At the default num_train_epochs=3
 # this run's own eval_loss already crashed from 1.78 -> 0.10 inside the first
 # 5% of epoch 1 -- 3 full passes over 10k examples buys little beyond that,
 # while costing ~11h of training alone. 2 epochs trades a bit of that
 # diminishing-returns tail for real headroom under the session cap.
-N_EPOCHS = 2
+# Measured on that 2-epoch run: 526.9 min of training alone. 1 epoch (~4.4h)
+# leaves real margin under both the session cap and a partly-spent weekly quota.
+N_EPOCHS = 1
 EFFECTIVE_BATCH_SIZE = 8  # per_device_train_batch_size(2) x gradient_accumulation_steps(4), see config.py
 MAX_STEPS = -(-N_TRAIN // EFFECTIVE_BATCH_SIZE) * N_EPOCHS  # ceil-div, matches train.py's own step math
 
@@ -128,9 +133,24 @@ step("5 . Benchmark matrix -- one process per system, on purpose")
 # grammar-constrained decoding on -- a separate catalogue entry from
 # "finetuned" (see ftspec/evaluation/benchmark.py) so both show up as their
 # own columns/McNemar comparison in one combined report.
+#
+# Baseline systems (base-*) regenerate identical text whenever the eval set is
+# unchanged, which it is across runs (fixed eval_seed) unless the generator
+# itself changed -- --cache-dir skips those model loads (~1-2h each on a T4).
+# A previous run's cache is picked up from any attached input that carries an
+# eval_cache/ folder (e.g. this kernel's earlier output re-uploaded as a
+# dataset); the cache key covers the exact eval inputs, so a stale one is
+# simply ignored, never wrongly reused.
+CACHE_DIR = CLONE_DIR / "outputs" / "eval_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+for prior in Path("/kaggle/input").glob("**/eval_cache"):
+    if prior.is_dir():
+        shutil.copytree(prior, CACHE_DIR, dirs_exist_ok=True)
+        print(f"seeded eval cache from {prior}")
 for systems in EVAL_SYSTEMS:
     run(["ftspec", "evaluate", "--profile", PROFILE, "--systems", systems,
-         "--gpu-cost-per-hour", GPU_COST_PER_HOUR], cwd=CLONE_DIR, check=False)
+         "--gpu-cost-per-hour", GPU_COST_PER_HOUR, "--cache-dir", str(CACHE_DIR)],
+        cwd=CLONE_DIR, check=False)
 
 step("6 . Combine the per-system runs into one matrix")
 run(["ftspec", "combine-eval", "--profile", PROFILE,
@@ -162,6 +182,8 @@ for name in ("reports", "manifests"):
 adapter = CLONE_DIR / "outputs" / PROFILE / "lora_adapter"
 if adapter.exists():
     shutil.copytree(adapter, out / "lora_adapter", dirs_exist_ok=True)
+if CACHE_DIR.exists():
+    shutil.copytree(CACHE_DIR, out / "eval_cache", dirs_exist_ok=True)
 print("collected so far:")
 for p in sorted(out.rglob("*")):
     if p.is_file():

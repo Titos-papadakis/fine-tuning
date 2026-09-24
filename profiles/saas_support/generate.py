@@ -129,11 +129,13 @@ def build_signals(category: str, rng: random.Random) -> dict:
     churn_threat = rng.random() < churn_p
     data_loss_risk = (subcategory in ("sync_error", "app_crash", "integration_bug")) and rng.random() < 0.30
 
-    # Greek conversations use a per-category template, so entity availability
-    # follows the category rather than the English phrasing.
+    # Greek conversations use their own per-subcategory template, so entity
+    # availability follows the Greek phrasing rather than the English one.
     language = "el" if rng.random() < 0.15 else "en"
+    el_template_idx = None
     if language == "el":
-        el_text = sc.EL_ISSUE_BY_CATEGORY[category][0]
+        el_template_idx = rng.randrange(len(sc.EL_ISSUE_TEMPLATES[subcategory]))
+        el_text = sc.EL_ISSUE_TEMPLATES[subcategory][el_template_idx][0]
         template_has_order = "{order_id}" in el_text
         template_has_amount = "{amount}" in el_text
 
@@ -146,6 +148,7 @@ def build_signals(category: str, rng: random.Random) -> dict:
         "category": category,
         "subcategory": subcategory,
         "template_idx": template_idx,
+        "el_template_idx": el_template_idx,
         "sentiment": sentiment,
         "tier": tier,
         "is_repeat_contact": is_repeat_contact,
@@ -163,7 +166,11 @@ def fill(template: str, s: dict, ticket_ref: str) -> str:
     """Fill template slots, degrading gracefully when an entity is absent."""
     text = template
     if s["order_id"] is None:
-        text = text.replace("order {order_id}", "my recent order").replace("{order_id}", "that order")
+        text = (text.replace("την παραγγελία {order_id}", "την πρόσφατη παραγγελία μου")
+                    .replace("της παραγγελίας {order_id}", "της πρόσφατης παραγγελίας μου")
+                    .replace("παραγγελία {order_id}", "πρόσφατη παραγγελία")
+                    .replace("order {order_id}", "my recent order")
+                    .replace("{order_id}", "that order"))
     return text.format(
         product=s["product"],
         order_id=s["order_id"] or "",
@@ -224,7 +231,7 @@ def render_en(s: dict, status: str, action_lines: list, rng: random.Random) -> s
 def render_el(s: dict, status: str, action_lines: list, rng: random.Random) -> str:
     agent = rng.choice(sc.AGENT_NAMES)
     ticket_ref = rand_ticket_ref(rng)
-    customer_line, agent_probe = sc.EL_ISSUE_BY_CATEGORY[s["category"]]
+    customer_line, agent_probe = sc.EL_ISSUE_TEMPLATES[s["subcategory"]][s["el_template_idx"]]
 
     head = [
         rng.choice(sc.EL_GREETINGS).format(product=s["product"], agent=agent),
