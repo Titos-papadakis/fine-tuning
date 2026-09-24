@@ -39,12 +39,32 @@ def step(name):
 
 
 step("0 . Locate the mounted job packet")
-input_dirs = [p for p in Path("/kaggle/input").iterdir() if p.is_dir()]
-if len(input_dirs) != 1:
-    raise SystemExit(f"expected exactly one mounted dataset under /kaggle/input, "
-                      f"found {[str(p) for p in input_dirs]}")
-packet_dir = input_dirs[0]
+# Found by its job.db, not by assuming a mount depth: Kaggle moved dataset
+# mounts from /kaggle/input/<slug>/ to /kaggle/input/datasets/<owner>/<slug>/,
+# and a real run died picking /kaggle/input/datasets itself as the packet.
+db_files = sorted(Path("/kaggle/input").rglob("job.db"))
+if len(db_files) != 1:
+    raise SystemExit(f"expected exactly one job.db under /kaggle/input, found "
+                     f"{[str(p) for p in db_files]}")
+packet_dir = db_files[0].parent
+# `datasets create --dir-mode zip` uploads customer_data/ as a zip; if Kaggle
+# left it zipped, unpack it into a writable copy (inputs are read-only).
+zipped = packet_dir / "customer_data.zip"
+if zipped.exists() and not (packet_dir / "customer_data").exists():
+    staging = Path("/tmp/job_packet")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    shutil.copy(db_files[0], staging / "job.db")
+    shutil.unpack_archive(str(zipped), str(staging / "customer_data"))
+    nested = staging / "customer_data" / "customer_data"
+    if nested.is_dir():
+        shutil.move(str(nested), str(staging / "unnested"))
+        shutil.rmtree(staging / "customer_data")
+        (staging / "unnested").rename(staging / "customer_data")
+    packet_dir = staging
 print("packet:", packet_dir)
+for p in sorted(packet_dir.iterdir()):
+    print(" ", p.name)
 
 step("1 . Clone the repo")
 if CLONE_DIR.exists():

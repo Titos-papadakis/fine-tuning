@@ -64,6 +64,19 @@ usage_app = typer.Typer(help="Per-customer usage/billing counters.", no_args_is_
 app.add_typer(usage_app, name="usage")
 db_app = typer.Typer(help="The platform database itself (customers.db).", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+pipeline_app = typer.Typer(help="The whole onboarding chain for a customer, hands-off.",
+                            no_args_is_help=True)
+app.add_typer(pipeline_app, name="pipeline")
+report_app = typer.Typer(help="Customer-facing reports.", no_args_is_help=True)
+app.add_typer(report_app, name="report")
+
+
+def _ctx_or_exit(conn, customer_id: str) -> CustomerContext:
+    try:
+        return CustomerContext(conn, customer_id)
+    except UnknownCustomerError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from e
 
 log = get_logger("ftplatform.cli")
 
@@ -116,6 +129,95 @@ def customer_list():
     for c in customers:
         typer.echo(f"  {c.id:<16} {c.name:<24} {c.workload:<18} {c.status:<8} {c.created_at}")
     typer.echo("")
+
+
+@customer_app.command("import")
+def customer_import(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    path: Path = typer.Argument(..., exists=True, dir_okay=False,
+                                help="The customer's tickets: .csv (a text column, optional "
+                                     "output/label_json column) or .jsonl (input/output)."),
+    label_with: str | None = typer.Option(
+        None, help="Auto-label rows that have no label, e.g. 'gpt-4o-mini' (needs "
+                   "OPENAI_API_KEY; costs roughly $0.0003 per ticket). Off by default: "
+                   "unlabeled rows go to imports/to_label.jsonl instead."),
+    max_auto_label: int | None = typer.Option(None, help="Cap on auto-labeled rows (cost guard)."),
+):
+    """Bring a customer's own tickets in as training data.
+
+    Every row is validated against the workload's schema; bad labels are
+    rejected with a reason (imports/rejected.jsonl), never coerced. The
+    result (imports/corpus.jsonl) is used automatically by `baseline run`
+    and `pipeline start` instead of synthetic data."""
+    from ftplatform.customers import importer
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+    finally:
+        conn.close()
+
+    labeler = None
+    if label_with:
+        try:
+            labeler = importer.openai_labeler(ctx.profile, model=label_with)
+        except PermissionError as e:
+            typer.secho(str(e), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from e
+    try:
+        r = importer.import_corpus(ctx, path, labeler=labeler, labeler_name=label_with or "",
+                                   max_auto_label=max_auto_label)
+    except ValueError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+
+    typer.echo(f"\nread {r['read']} row(s) from {path}")
+    typer.echo(f"  labeled by customer:  {r['labeled']}")
+    typer.echo(f"  auto-labeled:         {r['auto_labeled']}")
+    typer.echo(f"  rejected:             {r['rejected']}  (see imports/rejected.jsonl)")
+    typer.echo(f"  still need a label:   {r['to_label']}  (imports/to_label.jsonl)")
+    typer.echo(f"  skipped (dup/empty):  {r['duplicate'] + r['empty']}")
+    color = typer.colors.GREEN if r["enough_to_train"] else typer.colors.YELLOW
+    typer.secho(f"\ncorpus now {r['corpus_total']} example(s) -> {r['corpus_path']}", fg=color)
+    if not r["enough_to_train"]:
+        typer.secho(f"  under {importer.MIN_RECOMMENDED_ROWS}: fine-tuning on this little is "
+                    f"unlikely to beat prompting -- label more first.", fg=typer.colors.YELLOW)
+    if r["auto_labeled"]:
+        typer.echo("  spot-check imports/review_sample.jsonl before training on auto-labels.")
+
+
+@customer_app.command("delete")
+def customer_delete(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    yes: bool = typer.Option(False, "--yes", help="Actually delete. Without it, only shows "
+                                                 "what would be removed."),
+    force: bool = typer.Option(False, help="Delete even with a live Stripe subscription."),
+):
+    """Remove a customer completely: database rows, customers/<id>/ (data,
+    models, logs) and its Kaggle staging dirs. Irreversible -- take a
+    `db backup` first if in doubt."""
+    from ftplatform.jobs import queue
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+        if not yes:
+            n_jobs = len(queue.list_jobs(conn, customer_id))
+            typer.echo(f"\nwould delete {customer_id!r} ({ctx.customer.name}): {n_jobs} job(s), "
+                       f"every db row, and {ctx.customer_root()}")
+            typer.echo("re-run with --yes to do it.")
+            return
+        try:
+            result = store.delete(conn, customer_id, force=force)
+        except store.CustomerHasLiveSubscriptionError as e:
+            typer.secho(str(e), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from e
+    finally:
+        conn.close()
+
+    rows = sum(result["rows"].values())
+    typer.secho(f"\ndeleted {customer_id!r}: {rows} db row(s), {len(result['paths'])} "
+                f"director(ies).", fg=typer.colors.GREEN)
 
 
 @baseline_app.command("run")
@@ -665,6 +767,10 @@ def review_pending(customer_id: str = typer.Argument(..., help="Customer id, e.g
     finally:
         conn.close()
 
+    import json as json_mod
+
+    from ftplatform.selfimprove.label import suggestion
+
     rows = pending(ctx)
     if not rows:
         typer.echo("nothing pending")
@@ -674,7 +780,15 @@ def review_pending(customer_id: str = typer.Argument(..., help="Customer id, e.g
                     f"latency_ms={r['latency_ms']:.0f} valid={r['contract_valid']}")
         if r.get("input"):
             typer.echo(f"  input:  {r['input'][:200]}")
-            typer.echo(f"  output: {r['output']}")
+            s = suggestion(r)
+            if s is not None:
+                typer.echo(f"  model:  {json_mod.dumps(s, ensure_ascii=False)}")
+                typer.echo(f"  -> right?  ftplatform review correct {customer_id} "
+                           f"--request-id {r['request_id']}")
+                typer.echo("  -> fix one field:  ... --set path.to.field=value")
+            else:
+                typer.echo(f"  output: {r['output']}")
+                typer.echo("  -> no parseable output; supply the full record with --output '{...}'")
         else:
             typer.echo("  (text not captured for this profile's compliance regime)")
 
@@ -708,37 +822,46 @@ def review_skip(
 def review_correct(
     customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
     request_id: str = typer.Option(..., help="From `ftplatform review pending`."),
-    output: str = typer.Option(..., help="The correct output, as a JSON object."),
+    output: str | None = typer.Option(
+        None, help="The full correct output as a JSON object. Omit to start from the "
+                   "model's own output instead."),
+    set_: list[str] = typer.Option(
+        [], "--set", help="Override one field of the starting record: path.to.field=value "
+                          "(repeatable). Values that parse as JSON are used as such."),
 ):
-    """Confirm a flagged row was wrong and supply the correct output.
+    """Record the correct output for a flagged row.
 
-    Appends to memory/corrections.jsonl; `ftplatform selfimprove run` folds
-    it into training.
+    Starts from the model's own output (or --output), applies any --set
+    overrides, and checks the result against the schema before recording
+    it -- a row with neither --output nor --set confirms the model was
+    right, which is still a real-traffic training example. Appends to
+    memory/corrections.jsonl; `ftplatform selfimprove run` folds it in.
     """
     import json as json_mod
 
     from ftplatform.selfimprove import label
 
-    try:
-        corrected = json_mod.loads(output)
-    except json_mod.JSONDecodeError as e:
-        typer.secho(f"--output must be valid JSON: {e}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from e
+    corrected = None
+    if output is not None:
+        try:
+            corrected = json_mod.loads(output)
+        except json_mod.JSONDecodeError as e:
+            typer.secho(f"--output must be valid JSON: {e}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from e
 
     conn = connect()
     try:
-        ctx = CustomerContext(conn, customer_id)
-        row = label.record_correction(ctx, request_id, corrected)
-    except UnknownCustomerError as e:
-        typer.secho(str(e), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from e
+        ctx = _ctx_or_exit(conn, customer_id)
+        edits = label.parse_set_args(set_)
+        row = label.correct(ctx, request_id, edits=edits, output=corrected)
     except ValueError as e:
         typer.secho(str(e), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from e
     finally:
         conn.close()
 
-    typer.secho(f"\ncorrection recorded for {row['request_id']!r}.", fg=typer.colors.GREEN)
+    what = "confirmed as correct" if output is None and not set_ else "correction recorded"
+    typer.secho(f"\n{what} for {row['request_id']!r}.", fg=typer.colors.GREEN)
 
 
 @selfimprove_app.command("run")
@@ -1359,6 +1482,160 @@ def db_backup(
     finally:
         conn.close()
     typer.secho(f"\nbacked up -> {written}", fg=typer.colors.GREEN)
+
+
+# --- pipeline: onboarding as one command ------------------------------------------
+
+def _print_pipeline(p: dict) -> None:
+    color = {"done": typer.colors.GREEN, "failed": typer.colors.RED,
+             "awaiting_approval": typer.colors.YELLOW}.get(p["status"])
+    typer.secho(f"\n{p['customer_id']}: stage={p['stage']} status={p['status']}", fg=color)
+    for stage, w in p["state"].get("winners", {}).items():
+        typer.echo(f"  {stage:<8} winner: {w['candidate_id']} / {w['system']} (score {w['score']})")
+    if p["state"].get("deploy_result"):
+        d = p["state"]["deploy_result"]
+        typer.echo(f"  deploy: {'PROMOTED' if d['deployed'] else 'not promoted -- ' + str(d['reason'])}")
+    if p["state"].get("error"):
+        typer.secho(f"  error: {p['state']['error']}", fg=typer.colors.RED)
+    if p["status"] == "awaiting_approval":
+        typer.echo(f"  review benchmark/leaderboard numbers, then: ftplatform approve "
+                   f"{p['customer_id']} && ftplatform pipeline drive {p['customer_id']}")
+
+
+@pipeline_app.command("start")
+def pipeline_start(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    n_train: int = typer.Option(200, help="Synthetic corpus size (ignored with an imported corpus)."),
+    n_val: int = typer.Option(40),
+    n_eval: int = typer.Option(150),
+    stage_a_top_k: int | None = typer.Option(
+        None, help="Try only the k historically-best base models (all by default). Saves GPU "
+                   "hours once earlier customers on this workload have run."),
+    lora_grid_top_k: int | None = typer.Option(None, help="Same, for the LoRA grid."),
+    with_stage_c: bool = typer.Option(False, help="Also sweep quantization/constrained decoding."),
+    max_steps: int = typer.Option(-1, help="Cap Stage-B training steps (-1: full epochs)."),
+    restart: bool = typer.Option(False, help="Replace a finished/failed pipeline."),
+):
+    """Set up the whole chain: baseline -> Stage A -> Stage B -> [Stage C] ->
+    deploy. Nothing runs until `pipeline drive`."""
+    from ftplatform.jobs import pipeline
+
+    conn = connect()
+    try:
+        _ctx_or_exit(conn, customer_id)
+        p = pipeline.start(conn, customer_id, restart=restart, n_train=n_train, n_val=n_val,
+                           n_eval=n_eval, stage_a_top_k=stage_a_top_k,
+                           lora_grid_top_k=lora_grid_top_k, with_stage_c=with_stage_c,
+                           max_steps=max_steps)
+    except pipeline.PipelineError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+    finally:
+        conn.close()
+    _print_pipeline(p)
+    typer.echo(f"  next: ftplatform pipeline drive {customer_id} [--kaggle-owner <user>]")
+
+
+@pipeline_app.command("drive")
+def pipeline_drive(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    kaggle_owner: str | None = typer.Option(
+        None, help="Run GPU jobs on Kaggle as this user (one at a time, polled until done) "
+                   "instead of on this machine."),
+    poll_interval_s: float = typer.Option(120.0, help="Seconds between Kaggle status checks."),
+    required_hours: float | None = typer.Option(
+        None, help="Refuse a Kaggle push if less weekly GPU quota than this remains."),
+):
+    """Run the pipeline until it's done, fails, or needs your approval.
+    Safe to stop and re-run: it resumes where it left off."""
+    from ftplatform.jobs import pipeline
+
+    def say(msg: str) -> None:
+        typer.echo(f"  {msg}")
+
+    run_job = (pipeline.kaggle_runner(kaggle_owner, poll_interval_s=poll_interval_s,
+                                      required_hours=required_hours, on_status=say)
+               if kaggle_owner else pipeline.run_job_locally)
+    conn = connect()
+    try:
+        _ctx_or_exit(conn, customer_id)
+        p = pipeline.drive(conn, customer_id, run_job=run_job, on_status=say)
+    except pipeline.PipelineError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+    finally:
+        conn.close()
+    _print_pipeline(p)
+
+
+@pipeline_app.command("status")
+def pipeline_status(customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'.")):
+    """Where this customer's pipeline is, and its recent log."""
+    from ftplatform.jobs import pipeline
+
+    conn = connect()
+    try:
+        p = pipeline.get(conn, customer_id)
+    finally:
+        conn.close()
+    if p is None:
+        typer.echo(f"no pipeline for {customer_id!r} -- `ftplatform pipeline start {customer_id}`")
+        return
+    _print_pipeline(p)
+    for line in p["state"]["log"][-10:]:
+        typer.echo(f"    {line}")
+
+
+# --- reports ------------------------------------------------------------------------
+
+@report_app.command("monthly")
+def report_monthly(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    period: str | None = typer.Option(None, help="'YYYY-MM'. Defaults to the current month."),
+    monthly_fee: float | None = typer.Option(
+        None, help="The customer's plan fee in USD, to show net savings (only when positive)."),
+    out: Path | None = typer.Option(None, help="Output .html path (default: "
+                                               "customers/<id>/reports/monthly-<period>.html)."),
+):
+    """The page to send a customer each month: volume handled, live quality,
+    equivalent GPT-4o cost, and how their model improved."""
+    from ftplatform.reporting import monthly
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+        path, r = monthly.write(conn, ctx, period=period, monthly_fee_usd=monthly_fee, out_path=out)
+    finally:
+        conn.close()
+    typer.secho(f"\nreport -> {path}", fg=typer.colors.GREEN)
+    typer.echo(f"  {r['usage']['requests']} request(s) in {r['period']}"
+               + (f", GPT-4o equivalent ${r['cost']['equivalent_usd']:,.2f}" if r["cost"] else ""))
+
+
+@kaggle_app.command("watch")
+def kaggle_watch(
+    job_id: str = typer.Argument(..., help="The job id passed to `kaggle start`."),
+    customer_id: str = typer.Argument(..., help="Customer id the job belongs to."),
+    owner: str = typer.Option(..., help="Your Kaggle username."),
+    poll_interval_s: float = typer.Option(120.0),
+):
+    """`kaggle poll`, repeated until the run finishes and its result is merged."""
+    import time
+
+    from ftplatform.remote.run_on_kaggle import default_work_dir, kernel_id_for, poll_and_finish_job
+
+    conn = connect()
+    try:
+        while (job := poll_and_finish_job(conn, customer_id, job_id, kernel_id_for(job_id, owner),
+                                          default_work_dir(job_id))) is None:
+            typer.echo(f"  still running -- next check in {poll_interval_s:.0f}s")
+            time.sleep(poll_interval_s)
+    finally:
+        conn.close()
+    color = typer.colors.GREEN if job["status"] == "done" else typer.colors.RED
+    typer.secho(f"\njob {job['id']!r} ({job['kind']}) -> {job['status']}", fg=color)
+    if job["status"] == "failed":
+        typer.echo(f"  {job['result']['error']}")
 
 
 if __name__ == "__main__":

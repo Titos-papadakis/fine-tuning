@@ -14,6 +14,43 @@ there's an actual signed customer, per the standing "no cost before a
 customer" rule. Everything up to and including that step is free and can
 be rehearsed today.
 
+## Fast path (the whole thing in four commands)
+
+```
+ftplatform customer add acme --name "Acme Inc" --workload saas_support
+ftplatform customer import acme tickets.csv [--label-with gpt-4o-mini]
+ftplatform pipeline start acme
+ftplatform pipeline drive acme --kaggle-owner <your-kaggle-user>
+```
+
+`customer import` validates every row against the schema and writes
+`imports/corpus.jsonl`, which the baseline uses instead of synthetic data
+(unlabeled rows go to `imports/to_label.jsonl` unless `--label-with` is
+given; auto-labels get a spot-check sample in `imports/review_sample.jsonl`).
+`pipeline drive` then runs baseline -> Stage A -> Stage B -> deploy on
+Kaggle one job at a time, polling each until its result is merged back, and
+stops at exactly one point for a first-time customer: it prints the winning
+candidate and waits for `ftplatform approve acme`, after which the same
+`pipeline drive` command finishes the deploy. It is safe to Ctrl-C and
+re-run at any point; `pipeline status acme` shows where it is.
+
+Baseline generations are cached per customer, so Stage A never re-runs the
+base model the baseline already measured. After that, steps 5-9 below
+(API key, billing, serve, review loop, backups) are unchanged -- in review,
+`ftplatform review correct acme --request-id <id> --set issue.subcategory=...`
+now fixes just the wrong field on top of the model's own output. Each month:
+
+```
+ftplatform report monthly acme --monthly-fee 3000
+```
+
+writes `customers/acme/reports/monthly-<YYYY-MM>.html` to send them.
+`ftplatform customer delete acme --yes` removes a customer entirely (it
+refuses while their Stripe subscription is still billable).
+
+The numbered sections below are the same flow step by step, for when you
+want to run or re-run one stage by hand.
+
 ## 0. Prerequisites (once, not per customer)
 
 - `pip install -e ".[train,serve,constrained,billing]"` — the full stack.

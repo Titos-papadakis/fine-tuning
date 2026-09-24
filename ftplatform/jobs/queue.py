@@ -69,6 +69,16 @@ def pop_next_pending(conn: sqlite3.Connection) -> dict | None:
     return get(conn, job_id)
 
 
+def claim(conn: sqlite3.Connection, job_id: str) -> dict | None:
+    """Claims one specific pending job (the pipeline driver runs its own
+    customer's jobs, not whatever happens to be oldest). None if it is no
+    longer pending."""
+    cur = conn.execute("UPDATE jobs SET status = 'running', started_at = ? "
+                       "WHERE id = ? AND status = 'pending'", (_now(), job_id))
+    conn.commit()
+    return get(conn, job_id) if cur.rowcount else None
+
+
 def mark_done(conn: sqlite3.Connection, job_id: str, result: dict) -> None:
     conn.execute("UPDATE jobs SET status = 'done', result_json = ?, finished_at = ? WHERE id = ?",
                  (json.dumps(result, ensure_ascii=False), _now(), job_id))

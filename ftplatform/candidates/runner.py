@@ -56,6 +56,12 @@ def run_baseline(
     manifests_dir = ctx.manifests_dir(BASELINE_CANDIDATE_ID)
     reports_dir = ctx.reports_dir(BASELINE_CANDIDATE_ID)
     fingerprint = ctx.config.fingerprint()
+    # Resolved through ctx rather than taken as a path in a job payload, so it
+    # still resolves after the customer tree is shipped to Kaggle in a packet.
+    if from_jsonl is None and ctx.imported_corpus_path().exists():
+        from_jsonl = ctx.imported_corpus_path()
+        log.info("using %s's imported corpus %s instead of synthetic data",
+                  ctx.customer.id, from_jsonl)
 
     with run_manifest("prepare", manifests_dir / "prepare.json", fingerprint,
                        params={"customer": ctx.customer.id, "n_train": n_train, "n_val": n_val,
@@ -80,7 +86,7 @@ def run_baseline(
         result = benchmark.run(
             profile=ctx.profile, eval_file=eval_file, results_dir=reports_dir,
             systems=systems, base_model=base_model, finetuned_model=None,
-            gpu_cost_per_hour=gpu_cost_per_hour,
+            gpu_cost_per_hour=gpu_cost_per_hour, cache_dir=ctx.generation_cache_dir(),
         )
         m.metrics = result
 
@@ -113,7 +119,7 @@ def run_stage_a_candidate(ctx: CustomerContext, candidate, gpu_cost_per_hour: fl
         result = benchmark.run(
             profile=ctx.profile, eval_file=eval_file, results_dir=reports_dir,
             systems=candidate.systems, base_model=candidate.base_model, finetuned_model=None,
-            gpu_cost_per_hour=gpu_cost_per_hour,
+            gpu_cost_per_hour=gpu_cost_per_hour, cache_dir=ctx.generation_cache_dir(),
         )
         m.metrics = result
     return result

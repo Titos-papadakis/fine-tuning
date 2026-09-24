@@ -34,7 +34,7 @@ class FakeRun:
 def test_write_dataset_metadata_writes_the_expected_id_and_title(tmp_path):
     kaggle_ops.write_dataset_metadata(tmp_path, "alice", "job-1", "job 1 title")
 
-    meta = json.loads((tmp_path / "datasets-metadata.json").read_text(encoding="utf-8"))
+    meta = json.loads((tmp_path / "dataset-metadata.json").read_text(encoding="utf-8"))
     assert meta["id"] == "alice/job-1"
     assert meta["title"] == "job 1 title"
 
@@ -111,6 +111,31 @@ def test_parse_kernel_status(stdout, expected):
 def test_kernel_status_uses_the_parser_on_real_stdout():
     fake = FakeRun({("kernels", "status", "alice/job-1"): (0, "status: complete")})
     assert kaggle_ops.kernel_status("alice/job-1", run=fake) == "complete"
+
+
+def test_kernel_status_is_not_found_for_a_never_pushed_kernel():
+    # Confirmed against a real account: Kaggle reports a kernel that has
+    # never been pushed as a 'kernels.get' permission error (403), not a
+    # 404 -- this used to propagate as an unhandled KaggleCommandError and
+    # crash `kaggle start` on a brand-new job's very first push, since
+    # preflight_check()'s concurrency guard calls kernel_status() on a slug
+    # that, for a new job, has never existed yet.
+    denied = ("Cannot access kernel 'alice/job-1' (Permission 'kernels.get' "
+              "was denied). The most likely cause is a wrong kernel slug.")
+    fake = FakeRun({("kernels", "status", "alice/job-1"): (1, denied)})
+    assert kaggle_ops.kernel_status("alice/job-1", run=fake) == "not_found"
+
+
+def test_kernel_status_still_raises_on_a_genuine_failure():
+    fake = FakeRun({("kernels", "status", "alice/job-1"): (1, "network error: timed out")})
+    with pytest.raises(kaggle_ops.KaggleCommandError):
+        kaggle_ops.kernel_status("alice/job-1", run=fake)
+
+
+def test_preflight_check_treats_a_never_pushed_kernel_as_safe_to_push():
+    denied = "Permission 'kernels.get' was denied."
+    fake = FakeRun({("kernels", "status", "alice/job-1"): (1, denied)})
+    kaggle_ops.preflight_check("alice/job-1", required_hours=None, run=fake)  # must not raise
 
 
 def test_download_kernel_output_creates_the_output_dir(tmp_path):

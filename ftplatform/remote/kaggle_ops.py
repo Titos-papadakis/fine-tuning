@@ -55,12 +55,14 @@ def _kaggle(args: list[str], run=subprocess.run) -> subprocess.CompletedProcess:
 
 
 def write_dataset_metadata(packet_dir: Path, owner: str, slug: str, title: str) -> Path:
-    """`kaggle datasets create/version` require a datasets-metadata.json
-    inside the upload folder naming the dataset -- written here rather than
-    left to `kaggle datasets init` so the id is exactly the one we're about
-    to poll for, not whatever init guesses from the folder name."""
+    """`kaggle datasets create/version` require a dataset-metadata.json
+    (singular -- confirmed against a real account; `datasets-metadata.json`
+    fails with "Metadata file not found") inside the upload folder naming
+    the dataset -- written here rather than left to `kaggle datasets init`
+    so the id is exactly the one we're about to poll for, not whatever init
+    guesses from the folder name."""
     packet_dir = Path(packet_dir)
-    meta_path = packet_dir / "datasets-metadata.json"
+    meta_path = packet_dir / "dataset-metadata.json"
     meta_path.write_text(json.dumps({
         "title": title,
         "id": f"{owner}/{slug}",
@@ -191,12 +193,55 @@ def _parse_kernel_status(raw_stdout: str) -> str:
 
 
 def kernel_status(kernel_id: str, run=subprocess.run) -> str:
-    result = _kaggle(["kernels", "status", kernel_id], run=run)
+    """"not_found" for a kernel that has never been pushed -- confirmed
+    against a real account: Kaggle reports this as a 'kernels.get' permission
+    error, not a 404, presumably to avoid leaking whether a slug belongs to
+    someone else's private kernel. Distinguished from a genuine failure by
+    that specific wording; matters because preflight_check()'s concurrency
+    guard must not block a job's first-ever push just because its
+    brand-new, never-pushed kernel "fails" a status check."""
+    try:
+        result = _kaggle(["kernels", "status", kernel_id], run=run)
+    except KaggleCommandError as e:
+        if "kernels.get" in str(e) and "denied" in str(e).lower():
+            return "not_found"
+        raise
     return _parse_kernel_status(result.stdout)
 
 
+# The kaggle CLI writes a kernel's log with a bare open() -- the locale
+# encoding, cp1253 on a Greek Windows box -- and crashes with
+# UnicodeEncodeError on any emoji in it (Unsloth prints one every run).
+# PYTHONUTF8/PYTHONIOENCODING don't reach that call; defaulting open() itself
+# to UTF-8 before the CLI starts does (confirmed against a real kernel).
+_UTF8_KAGGLE = (
+    "import builtins, runpy, sys\n"
+    "_open = builtins.open\n"
+    "def _utf8_open(f, mode='r', *a, **k):\n"
+    "    if 'b' not in mode and not a and 'encoding' not in k:\n"
+    "        k['encoding'] = 'utf-8'\n"
+    "    return _open(f, mode, *a, **k)\n"
+    "builtins.open = _utf8_open\n"
+    "sys.argv = ['kaggle', *sys.argv[1:]]\n"
+    "runpy.run_module('kaggle', run_name='__main__', alter_sys=True)\n"
+)
+
+
 def download_kernel_output(kernel_id: str, out_dir: Path, run=subprocess.run) -> Path:
+    """Runs the CLI with open() defaulted to UTF-8 (see _UTF8_KAGGLE). Still
+    tolerates that same crash if it somehow recurs once the files are on
+    disk -- the log is the last thing written, so files present is success."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    _kaggle(["kernels", "output", kernel_id, "-p", str(out_dir), "-q", "-o"], run=run)
+    args = ["kernels", "output", kernel_id, "-p", str(out_dir), "-q", "-o"]
+    try:
+        result = run([sys.executable, "-c", _UTF8_KAGGLE, *args], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise KaggleCommandError(f"kaggle {' '.join(args)} failed ({result.returncode}):\n"
+                                     f"{result.stdout}\n{result.stderr}")
+    except KaggleCommandError as e:
+        downloaded = any(p.is_file() and not p.name.endswith(".log") for p in out_dir.rglob("*"))
+        if "UnicodeEncodeError" in str(e) and downloaded:
+            return out_dir
+        raise
     return out_dir

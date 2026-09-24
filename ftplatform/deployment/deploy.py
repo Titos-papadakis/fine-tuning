@@ -133,12 +133,27 @@ def infer_base_model(ctx, candidate_id: str) -> str | None:
     return None
 
 
+def _winner_of(ctx, candidate_id: str) -> str | None:
+    path = ctx.manifests_dir(candidate_id) / "evaluate.json"
+    if not path.exists():
+        return None
+    winner = json.loads(path.read_text(encoding="utf-8")).get("params", {}).get("winner_candidate_id")
+    return winner if winner and winner != candidate_id else None
+
+
 def _promote(ctx, candidate_id: str, row: CandidateRow, conn=None, is_rollback: bool = False) -> None:
     src = ctx.candidate_dir(candidate_id)
     dst = ctx.production_dir()
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
+
+    # A Stage-C candidate trains nothing -- it re-evaluates a Stage-B winner's
+    # adapter -- so its own dir has no weights. Without this, promoting one
+    # left production/ with nothing `serve` could load.
+    winner = _winner_of(ctx, candidate_id)
+    if winner and not (dst / "lora_adapter").exists() and ctx.adapter_dir(winner).exists():
+        shutil.copytree(ctx.adapter_dir(winner), dst / "lora_adapter")
 
     base_model = infer_base_model(ctx, candidate_id)
     if base_model:

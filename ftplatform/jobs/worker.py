@@ -74,7 +74,11 @@ def run_one(conn) -> dict | None:
     job = queue.pop_next_pending(conn)
     if job is None:
         return None
+    return run_claimed(conn, job)
 
+
+def run_claimed(conn, job: dict) -> dict:
+    """Execute an already-claimed ('running') job and record its outcome."""
     log.info("running job %s (%s) for customer %s", job["id"], job["kind"], job["customer_id"])
     try:
         ctx = CustomerContext(conn, job["customer_id"])

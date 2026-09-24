@@ -83,8 +83,13 @@ def start_job_on_kaggle(conn: sqlite3.Connection, customer_id: str, job_id: str,
 
     kernel_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(KERNEL_SOURCE_DIR / KERNEL_CODE_FILE, kernel_dir / KERNEL_CODE_FILE)
+    # title == slug on purpose: Kaggle derives a new kernel's slug from its
+    # title, not from the metadata id -- confirmed on a real push, where a
+    # descriptive title created ".../ftplatform-job-<id>-pipeline-test" while
+    # every status/poll call asked for ".../ftplatform-job-<id>" and got a
+    # permission error forever.
     kaggle_ops.write_kernel_metadata(
-        kernel_dir, owner, slug, title=f"ftplatform job {job_id} ({customer_id})",
+        kernel_dir, owner, slug, title=slug,
         code_file=KERNEL_CODE_FILE, dataset_id=dataset_id)
     kaggle_ops.push_kernel(kernel_dir, run=run)
 

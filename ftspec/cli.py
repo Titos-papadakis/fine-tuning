@@ -238,6 +238,10 @@ def evaluate(
         False, "--acknowledge-egress",
         help="Permit hosted-API baselines for a profile that forbids external egress."),
     self_test: bool = typer.Option(False, help="Validate the metrics pipeline; runs no model."),
+    cache_dir: Path | None = typer.Option(
+        None, help="Reuse non-finetuned systems' generations from an earlier run on the "
+                   "identical eval inputs instead of reloading the model (scores are always "
+                   "recomputed). Off by default."),
 ):
     """Benchmark matrix: adherence, accuracy, p50/p99 latency, cost per 100k calls."""
     from ftspec.evaluation import benchmark
@@ -263,6 +267,7 @@ def evaluate(
                 finetuned_model=finetuned_model or str(cfg.adapter_dir(prof.name)),
                 limit=limit, gpu_cost_per_hour=gpu_cost_per_hour,
                 max_new_tokens=max_new_tokens, acknowledge_egress=acknowledge_egress,
+                cache_dir=cache_dir,
             )
         except (RuntimeError, ValueError) as e:
             # A compliance refusal or a missing credential is an expected

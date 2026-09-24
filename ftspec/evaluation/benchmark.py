@@ -468,6 +468,74 @@ def render_report(results: dict, profile: Profile, gpu_cost_per_hour: float,
 
 # --- Orchestration -----------------------------------------------------------
 
+# --- Generation cache ----------------------------------------------------------
+# A non-finetuned system's outputs depend only on (model, prompt, decoding,
+# eval inputs) -- re-running base-schema/base-rubric/base-constrained/gpt4o-*
+# on an unchanged eval set spends GPU-hours (or API dollars) to regenerate
+# byte-identical text. Only the generated text/latency/tokens are cached;
+# scores are always recomputed against the current gold and scoring code, so
+# a scoring change never serves stale numbers.
+
+CACHE_FORMAT_VERSION = 1
+
+
+def cache_key(spec: SystemSpec, records: list, profile: Profile, max_new_tokens: int) -> str | None:
+    """None for finetuned systems: their output depends on adapter weights that
+    change between runs under the same path, so caching them would be wrong."""
+    if spec.is_finetuned:
+        return None
+    import hashlib
+    h = hashlib.sha256()
+    parts = [str(CACHE_FORMAT_VERSION), profile.name, spec.name, spec.backend, spec.model,
+             spec.prompt_variant, str(spec.constrained), str(spec.load_in_4bit),
+             str(max_new_tokens), profile.prompts.variants()[spec.prompt_variant]]
+    for p in parts:
+        h.update(p.encode("utf-8"))
+        h.update(b"\0")
+    for r in records:
+        h.update(r["messages"][1]["content"].encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()[:32]
+
+
+def load_cached_result(spec: SystemSpec, key: str, cache_dir: Path, records: list,
+                        profile: Profile) -> RunResult | None:
+    path = Path(cache_dir) / f"{key}.jsonl"
+    if not path.exists():
+        return None
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    if len(rows) != len(records):
+        return None
+    plan = profile.scoring_plan()
+    result = RunResult(spec=spec)
+    for row, rec in zip(rows, records, strict=True):
+        pred, valid = parse_prediction(row["output"], profile)
+        gold = json.loads(rec["messages"][2]["content"])
+        result.raw_outputs.append(row["output"])
+        result.latencies_ms.append(row["latency_ms"])
+        result.prompt_tokens.append(row["prompt_tokens"])
+        result.output_tokens.append(row["output_tokens"])
+        result.valid_flags.append(1.0 if valid else 0.0)
+        result.scores.append(M.score_record(pred if valid else None, gold, plan))
+    return result
+
+
+def save_cached_result(result: RunResult, key: str, cache_dir: Path) -> Path:
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"{key}.jsonl"
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for raw, latency, p_tok, o_tok in zip(result.raw_outputs, result.latencies_ms,
+                                               result.prompt_tokens, result.output_tokens,
+                                               strict=True):
+            f.write(json.dumps({"output": raw, "latency_ms": latency, "prompt_tokens": p_tok,
+                                 "output_tokens": o_tok}, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+    return path
+
+
 def run(profile: Profile, eval_file: Path, results_dir: Path,
          systems: str = "finetuned",
          base_model: str = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
@@ -477,7 +545,8 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
          max_new_tokens: int = 512,
          acknowledge_egress: bool = False,
          load_in_4bit: bool = True,
-         constrained: bool | None = None) -> dict:
+         constrained: bool | None = None,
+         cache_dir: Path | None = None) -> dict:
     """Run the requested systems and write the comparison matrix.
 
     `load_in_4bit` and `constrained` override every *local* system's
@@ -485,6 +554,10 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
     identical to every call before these existed). This is how
     ftplatform's Stage C measures the same trained adapter under a
     quantization or constrained-decoding toggle without a new backend.
+
+    `cache_dir`, when given, reuses a non-finetuned system's generations from
+    an earlier run on the identical eval inputs instead of regenerating them
+    (see cache_key()). None (the default) never reads or writes a cache.
     """
     catalogue = system_catalogue()
     records = load_eval_set(eval_file, limit)
@@ -499,6 +572,7 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
     results: dict = {}
     refused: list = []
     failed: dict = {}
+    cached: list = []
 
     for name in requested:
         spec = catalogue[name]
@@ -524,10 +598,20 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
                              "this is recorded in the run manifest",
                              name, profile.compliance.regime)
 
-        log.info("running %s (prompt=%s, model=%s)", name, spec.prompt_variant, spec.model)
+        key = cache_key(spec, records, profile, max_new_tokens) if cache_dir else None
+        hit = load_cached_result(spec, key, cache_dir, records, profile) if key else None
+        if hit is not None:
+            log.info("reusing cached %s generations (key %s) -- no model load", name, key)
+            result = hit
+            cached.append(name)
+        else:
+            log.info("running %s (prompt=%s, model=%s)", name, spec.prompt_variant, spec.model)
         try:
-            result = run_openai(spec, records, profile) if spec.is_hosted \
-                else run_local(spec, records, profile, max_new_tokens)
+            if hit is None:
+                result = run_openai(spec, records, profile) if spec.is_hosted \
+                    else run_local(spec, records, profile, max_new_tokens)
+                if key:
+                    save_cached_result(result, key, cache_dir)
         except Exception as e:                                        # noqa: BLE001
             # One system's OOM should not discard the systems that already
             # succeeded. Confirmed on a real T4: without this, a crash loading
@@ -596,6 +680,7 @@ def run(profile: Profile, eval_file: Path, results_dir: Path,
         "report_path": str(out),
         "refused_for_compliance": refused,
         "failed_systems": failed,
+        "cached_systems": cached,
         "egress_acknowledged": acknowledge_egress,
         "systems": _summarize_systems(results, headline, gpu_cost_per_hour),
     }

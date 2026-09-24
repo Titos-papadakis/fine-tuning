@@ -122,6 +122,20 @@ CREATE TABLE IF NOT EXISTS usage_counters (
 -- whether their subscription is currently active. status mirrors Stripe's
 -- own subscription status vocabulary ('active', 'past_due', 'canceled', ...)
 -- plus 'unlinked'/'linked' for the two states before a subscription exists.
+-- One onboarding pipeline per customer (baseline -> Stage A -> Stage B ->
+-- optional Stage C -> deploy), advanced by ftplatform/jobs/pipeline.py.
+-- state_json holds the options it was started with, the job ids of each
+-- stage, and each stage's chosen winner, so a restarted driver resumes
+-- exactly where the last one stopped instead of re-running finished stages.
+CREATE TABLE IF NOT EXISTS pipelines (
+    customer_id   TEXT PRIMARY KEY REFERENCES customers(id),
+    stage         TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    state_json    TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS billing_accounts (
     customer_id             TEXT PRIMARY KEY REFERENCES customers(id),
     email                   TEXT NOT NULL,

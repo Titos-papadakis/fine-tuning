@@ -92,3 +92,19 @@ class CustomerContext:
 
     def benchmark_dir(self) -> Path:
         return self.config.resolve(f"customers/{self.customer.id}/benchmark")
+
+    def generation_cache_dir(self) -> Path:
+        """Per customer, never shared: the cache holds generations over this
+        customer's own eval texts."""
+        return self.benchmark_dir() / "generation_cache"
+
+    def imports_dir(self) -> Path:
+        """The customer's own raw/labeled data as handed over, before it is
+        split into train/val/eval under data_dir()."""
+        return self.config.resolve(f"customers/{self.customer.id}/imports")
+
+    def imported_corpus_path(self) -> Path:
+        return self.imports_dir() / "corpus.jsonl"
+
+    def customer_root(self) -> Path:
+        return self.config.resolve(f"customers/{self.customer.id}")
