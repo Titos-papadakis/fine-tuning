@@ -14,6 +14,7 @@ from pathlib import Path
 
 import typer
 
+from ftplatform import audit
 from ftplatform.customers import store
 from ftplatform.customers.context import CustomerContext, UnknownCustomerError
 from ftplatform.db import connect
@@ -69,6 +70,12 @@ pipeline_app = typer.Typer(help="The whole onboarding chain for a customer, hand
 app.add_typer(pipeline_app, name="pipeline")
 report_app = typer.Typer(help="Customer-facing reports.", no_args_is_help=True)
 app.add_typer(report_app, name="report")
+privacy_app = typer.Typer(help="Per-customer redaction and retention of captured traffic.",
+                          no_args_is_help=True)
+app.add_typer(privacy_app, name="privacy")
+audit_app = typer.Typer(help="Who changed what, when -- the append-only audit log.",
+                        no_args_is_help=True)
+app.add_typer(audit_app, name="audit")
 
 
 def _ctx_or_exit(conn, customer_id: str) -> CustomerContext:
@@ -90,17 +97,54 @@ def main(verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug-leve
 def customer_add(
     customer_id: str = typer.Argument(..., help="Short, URL-safe id, e.g. 'acme'."),
     name: str = typer.Option(..., help="Display name."),
-    workload: str = typer.Option(..., help="Vertical to run for this customer, e.g. saas_support."),
+    workload: str = typer.Option(
+        ..., help="Vertical to run for this customer, e.g. saas_support -- or 'custom' "
+                  "with --schema for the customer's own JSON Schema."),
+    schema: Path | None = typer.Option(None, exists=True, dir_okay=False,
+                                       help="JSON Schema of the record to extract (custom only)."),
+    headline_field: str | None = typer.Option(
+        None, help="Dotted path of the field that matters most, e.g. 'issue.priority' "
+                   "(custom only; reported as the headline accuracy)."),
+    free_text_field: list[str] = typer.Option(
+        [], help="Field scored by token overlap instead of exact match, e.g. a summary "
+                 "(custom only, repeatable)."),
+    regime: str = typer.Option("none", help="none | GDPR | HIPAA | PCI-DSS (custom only)."),
+    allow_external_api: bool | None = typer.Option(
+        None, "--allow-external-api/--no-external-api",
+        help="May this customer's text be sent to hosted APIs (auto-labeling, gpt4o "
+             "baselines)? Default: no for HIPAA/PCI-DSS, yes otherwise."),
 ):
     """Register a new customer. Its data and models are isolated from every other one."""
-    if workload not in available():
-        typer.secho(f"Unknown workload {workload!r}. Choices: {', '.join(available())}",
-                     fg=typer.colors.RED, err=True)
+    from ftplatform.customers import custom_workload
+
+    is_custom = workload == custom_workload.CUSTOM
+    if not is_custom and workload not in available():
+        typer.secho(f"Unknown workload {workload!r}. Choices: "
+                    f"{', '.join([*available(), 'custom'])}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
+    if is_custom != (schema is not None):
+        typer.secho("--schema is required with --workload custom, and only valid with it",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    settings = {"headline_field": headline_field, "free_text_fields": tuple(free_text_field),
+                "regime": regime, "allows_external_api": allow_external_api}
+    if is_custom:
+        try:
+            custom_workload.build_profile(schema, **settings)  # fail before creating anything
+        except (ValueError, OSError) as e:
+            typer.secho(f"invalid schema: {e}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from e
 
     conn = connect()
     try:
         customer = store.create(conn, customer_id, name, workload)
+        if is_custom:
+            import ftspec.config as config_mod
+            custom_workload.install(config_mod.REPO_ROOT / "customers" / customer.id,
+                                    schema, **settings)
+        audit.record(conn, "customer.add", customer.id,
+                     {"workload": workload, "regime": regime if is_custom else None})
     except ValueError as e:
         typer.secho(str(e), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from e
@@ -109,6 +153,9 @@ def customer_add(
 
     typer.secho(f"customer {customer.id!r} added (workload={customer.workload})",
                 fg=typer.colors.GREEN)
+    if is_custom:
+        typer.echo(f"  custom workloads train only on the customer's own data -- next: "
+                   f"ftplatform customer import {customer.id} <tickets.csv>")
 
 
 @customer_app.command("list")
@@ -170,6 +217,15 @@ def customer_import(
     except ValueError as e:
         typer.secho(str(e), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from e
+
+    conn = connect()
+    try:
+        audit.record(conn, "data.import", customer_id,
+                     {k: r[k] for k in ("read", "labeled", "auto_labeled", "rejected",
+                                         "to_label", "corpus_total")}
+                     | {"labeler": label_with})
+    finally:
+        conn.close()
 
     typer.echo(f"\nread {r['read']} row(s) from {path}")
     typer.echo(f"  labeled by customer:  {r['labeled']}")
@@ -854,6 +910,9 @@ def review_correct(
         ctx = _ctx_or_exit(conn, customer_id)
         edits = label.parse_set_args(set_)
         row = label.correct(ctx, request_id, edits=edits, output=corrected)
+        audit.record(conn, "review.correct", customer_id,
+                     {"request_id": request_id, "fields_set": sorted(edits),
+                      "full_output_supplied": corrected is not None})
     except ValueError as e:
         typer.secho(str(e), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from e
@@ -888,6 +947,9 @@ def selfimprove_run(
         result = retrain_cycle.run_cycle(ctx, base_model, lora_r, lora_alpha, conn=conn,
                                            min_adherence_pct=min_adherence, epsilon=epsilon,
                                            max_steps=max_steps, gpu_cost_per_hour=gpu_cost_per_hour)
+        audit.record(conn, "selfimprove.run", customer_id,
+                     {"added": result["folded"]["added"], "rejected": result["folded"]["rejected"],
+                      "candidate_id": result["candidate_id"], "deployed": result.get("deployed")})
     except UnknownCustomerError as e:
         typer.secho(str(e), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from e
@@ -940,6 +1002,7 @@ def approve_customer(customer_id: str = typer.Argument(..., help="Customer id, e
     conn = connect()
     try:
         approvals.approve(conn, customer_id)
+        audit.record(conn, "deploy.approve", customer_id)
     finally:
         conn.close()
     typer.secho(f"\n{customer_id!r} approved for automated deployment.", fg=typer.colors.GREEN)
@@ -1207,6 +1270,12 @@ def serve_shared(
     from ftspec.core.registry import load_profile
     from ftspec.serving.serve import serve as ftspec_serve
 
+    if workload == "custom":
+        typer.secho("custom-workload customers each have their own schema, so they cannot share "
+                    "one server's profile -- serve each with `ftplatform serve <customer_id>`.",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
     conn = connect()
     try:
         adapters = discover_production_adapters(conn, workload)
@@ -1281,6 +1350,8 @@ def apikey_create(
             typer.secho(str(e), fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2) from e
         key = keys_mod.create_key(conn, customer_id, label=label)
+        audit.record(conn, "apikey.create", customer_id,
+                     {"label": label, "key_hash_prefix": keys_mod._hash(key)[:16]})
     finally:
         conn.close()
 
@@ -1323,6 +1394,9 @@ def apikey_revoke(
     conn = connect()
     try:
         n = keys_mod.revoke_key(conn, key_hash_prefix)
+        if n:
+            audit.record(conn, "apikey.revoke", None,
+                         {"key_hash_prefix": key_hash_prefix, "revoked": n})
     finally:
         conn.close()
 
@@ -1428,6 +1502,8 @@ def usage_stripe_subscribe(
         status = sb.fetch_subscription_status(stripe_subscription_id)
         sb.record_subscription(conn, customer_id, stripe_subscription_id, status)
         result = sb.billing_status(conn, customer_id)
+        audit.record(conn, "billing.subscribe", customer_id,
+                     {"price": price, "status": result["status"]})
     finally:
         conn.close()
     color = typer.colors.GREEN if result["status"] == "active" else typer.colors.YELLOW
@@ -1479,6 +1555,7 @@ def db_backup(
     conn = connect()
     try:
         written = db_backup_fn(conn, dest)
+        audit.record(conn, "db.backup", None, {"path": str(written)})
     finally:
         conn.close()
     typer.secho(f"\nbacked up -> {written}", fg=typer.colors.GREEN)
@@ -1527,6 +1604,7 @@ def pipeline_start(
                            n_eval=n_eval, stage_a_top_k=stage_a_top_k,
                            lora_grid_top_k=lora_grid_top_k, with_stage_c=with_stage_c,
                            max_steps=max_steps)
+        audit.record(conn, "pipeline.start", customer_id, {"restart": restart})
     except pipeline.PipelineError as e:
         typer.secho(str(e), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from e
@@ -1610,6 +1688,95 @@ def report_monthly(
     typer.secho(f"\nreport -> {path}", fg=typer.colors.GREEN)
     typer.echo(f"  {r['usage']['requests']} request(s) in {r['period']}"
                + (f", GPT-4o equivalent ${r['cost']['equivalent_usd']:,.2f}" if r["cost"] else ""))
+
+
+# --- privacy / audit ----------------------------------------------------------------
+
+@privacy_app.command("show")
+def privacy_show(customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'.")):
+    """This customer's redaction rules and retention window."""
+    from ftplatform import privacy
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+    finally:
+        conn.close()
+    p = privacy.load(ctx)
+    captured = ctx.profile.compliance.regime == "none"
+    typer.echo(f"\n{customer_id}: regime={ctx.profile.compliance.regime}, "
+               f"text capture {'ON' if captured else 'OFF (regulated -- metadata only)'}")
+    typer.echo(f"  redacted before writing: {', '.join(p['redact']) or 'nothing'}")
+    typer.echo(f"  captured traffic kept:   {p['retention_days']} day(s)\n")
+
+
+@privacy_app.command("set")
+def privacy_set(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    retention_days: int | None = typer.Option(None, help="Keep captured traffic this long."),
+    redact: str | None = typer.Option(
+        None, help="Comma-separated rules to redact, e.g. 'email,phone,pan' ('' for none)."),
+):
+    """Change what is redacted from captured traffic and how long it is kept."""
+    from ftplatform import privacy
+
+    rules = None if redact is None else tuple(r.strip() for r in redact.split(",") if r.strip())
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+        try:
+            p = privacy.save(ctx, redact=rules, retention_days=retention_days)
+        except ValueError as e:
+            typer.secho(str(e), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from e
+        audit.record(conn, "privacy.set", customer_id,
+                     {"redact": list(p["redact"]), "retention_days": p["retention_days"]})
+    finally:
+        conn.close()
+    typer.secho(f"\n{customer_id}: redact={', '.join(p['redact']) or 'nothing'}, "
+                f"retention={p['retention_days']}d", fg=typer.colors.GREEN)
+
+
+@privacy_app.command("enforce")
+def privacy_enforce(
+    customer_id: str | None = typer.Argument(None, help="One customer (default: all)."),
+):
+    """Delete captured traffic older than each customer's retention window.
+    Meant to run daily (cron / Task Scheduler)."""
+    from ftplatform import privacy
+
+    conn = connect()
+    try:
+        ids = [customer_id] if customer_id else [c.id for c in store.list_all(conn)]
+        for cid in ids:
+            removed = privacy.enforce_retention(_ctx_or_exit(conn, cid))
+            total = sum(removed.values())
+            if total:
+                audit.record(conn, "privacy.retention", cid, removed)
+            typer.echo(f"  {cid}: removed {total} captured row(s) past retention")
+    finally:
+        conn.close()
+
+
+@audit_app.command("list")
+def audit_list(
+    customer_id: str | None = typer.Argument(None, help="Filter to one customer."),
+    limit: int = typer.Option(50, help="Most recent N entries."),
+):
+    """The audit trail, oldest first -- ids and counts only, never customer text."""
+    import json as json_mod
+
+    conn = connect()
+    try:
+        rows = audit.entries(conn, customer_id, limit=limit)
+    finally:
+        conn.close()
+    if not rows:
+        typer.echo("no audit entries")
+        return
+    for r in rows:
+        typer.echo(f"  {r['at']}  {r['actor']:<12} {r['action']:<20} {r['customer_id'] or '-':<14} "
+                   f"{json_mod.dumps(r['detail'], ensure_ascii=False)}")
 
 
 @kaggle_app.command("watch")

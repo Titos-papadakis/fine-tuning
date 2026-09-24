@@ -34,6 +34,16 @@ def _write_row(ctx, request, text, prompt_tokens, completion_tokens, elapsed_ms)
 
     user_message = next((m.content for m in request.messages if m.role == "user"), "")
     record, _reason = ctx.profile.contract.validate(text)
+    if capture_text:
+        # Validated first, redacted after: validity reflects what the model
+        # actually returned, while what reaches disk never holds the
+        # identifiers the customer's policy names.
+        from ftplatform import privacy
+        from ftspec.core.redaction import redact, redact_value
+        rules = privacy.load(ctx)["redact"]
+        user_message = redact(user_message, rules)
+        text = redact(text, rules)
+        record = redact_value(record, rules) if record is not None else None
     row = {
         "request_id": uuid.uuid4().hex[:16],
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),

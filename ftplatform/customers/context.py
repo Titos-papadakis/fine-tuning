@@ -21,7 +21,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from ftplatform.customers import store
+from ftplatform.customers import custom_workload, store
 from ftplatform.customers.models import Customer
 from ftspec.config import Config
 from ftspec.core.profile import Profile
@@ -42,12 +42,16 @@ class CustomerContext:
         if customer is None:
             raise UnknownCustomerError(f"no such customer: {customer_id!r}")
         self.customer: Customer = customer
-        self.profile: Profile = load_profile(customer.workload)
 
         cfg = Config(profile=customer.workload)
         cfg.data.root = f"customers/{customer.id}/data"
         cfg.outputs_root = f"customers/{customer.id}/model/{customer.workload}"
         self.config = cfg
+
+        if customer.workload == custom_workload.CUSTOM:
+            self.profile: Profile = custom_workload.load(self.customer_root())
+        else:
+            self.profile = load_profile(customer.workload)
 
     # --- data ------------------------------------------------------------
 

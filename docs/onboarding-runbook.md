@@ -48,6 +48,33 @@ writes `customers/acme/reports/monthly-<YYYY-MM>.html` to send them.
 `ftplatform customer delete acme --yes` removes a customer entirely (it
 refuses while their Stripe subscription is still billable).
 
+**A customer with their own record format** (not one of the shipped
+workloads) needs no code, only their JSON Schema:
+
+```
+ftplatform customer add initech --name "Initech" --workload custom \
+    --schema initech_schema.json --headline-field issue.priority \
+    [--free-text-field summary] [--regime GDPR|HIPAA|PCI-DSS]
+ftplatform customer import initech tickets.csv
+```
+
+then `pipeline start` / `pipeline drive` exactly as above. A custom
+workload trains only on imported data, and HIPAA/PCI-DSS regimes block
+hosted-API labeling and text capture automatically.
+
+**Data handling, once per customer and then daily:**
+
+```
+ftplatform privacy set acme --retention-days 90 --redact email,phone,pan,ssn,iban
+ftplatform privacy enforce            # schedule daily (cron / Task Scheduler)
+ftplatform audit list acme            # the trail a security reviewer asks for
+```
+
+`docs/security-and-data-handling.md` is the document to send a customer's
+security/procurement team. It lists Kaggle as a subprocessor for training.
+When deleting a customer, also delete their `ftplatform-job-*` datasets and
+notebooks on Kaggle by hand (not yet automatic).
+
 The numbered sections below are the same flow step by step, for when you
 want to run or re-run one stage by hand.
 

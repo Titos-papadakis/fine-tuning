@@ -83,4 +83,8 @@ def delete(conn: sqlite3.Connection, customer_id: str, repo_root: Path | None = 
         if path.exists():
             shutil.rmtree(path)
             removed.append(str(path))
+
+    from ftplatform import audit
+    audit.record(conn, "customer.delete", customer_id,
+                 {"rows": rows, "directories_removed": len(removed), "forced": force})
     return {"rows": rows, "paths": removed}

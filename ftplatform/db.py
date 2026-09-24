@@ -114,14 +114,6 @@ CREATE TABLE IF NOT EXISTS usage_counters (
     PRIMARY KEY (customer_id, period)
 );
 
--- One row per customer that has been linked to Stripe -- created the moment
--- a customer is ready to actually be charged, not at `customer add` time (a
--- customer can exist and be trained/evaluated for a good while before any
--- money changes hands). Never holds card/payment details -- that stays in
--- Stripe; this is only enough to know who a customer is over there and
--- whether their subscription is currently active. status mirrors Stripe's
--- own subscription status vocabulary ('active', 'past_due', 'canceled', ...)
--- plus 'unlinked'/'linked' for the two states before a subscription exists.
 -- One onboarding pipeline per customer (baseline -> Stage A -> Stage B ->
 -- optional Stage C -> deploy), advanced by ftplatform/jobs/pipeline.py.
 -- state_json holds the options it was started with, the job ids of each
@@ -136,6 +128,25 @@ CREATE TABLE IF NOT EXISTS pipelines (
     updated_at    TEXT NOT NULL
 );
 
+-- Append-only; see ftplatform/audit.py. No FK on customer_id on purpose: the
+-- record of a customer's deletion must outlive the customer row.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    at            TEXT NOT NULL,
+    actor         TEXT NOT NULL,
+    customer_id   TEXT,
+    action        TEXT NOT NULL,
+    detail_json   TEXT NOT NULL
+);
+
+-- One row per customer that has been linked to Stripe -- created the moment
+-- a customer is ready to actually be charged, not at `customer add` time (a
+-- customer can exist and be trained/evaluated for a good while before any
+-- money changes hands). Never holds card/payment details -- that stays in
+-- Stripe; this is only enough to know who a customer is over there and
+-- whether their subscription is currently active. status mirrors Stripe's
+-- own subscription status vocabulary ('active', 'past_due', 'canceled', ...)
+-- plus 'unlinked'/'linked' for the two states before a subscription exists.
 CREATE TABLE IF NOT EXISTS billing_accounts (
     customer_id             TEXT PRIMARY KEY REFERENCES customers(id),
     email                   TEXT NOT NULL,

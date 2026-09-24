@@ -178,6 +178,9 @@ def _promote(ctx, candidate_id: str, row: CandidateRow, conn=None, is_rollback: 
     if conn is not None:
         registry.record(conn, ctx.customer.id, ctx.profile.name, candidate_id, snapshot,
                          is_rollback=is_rollback)
+        from ftplatform import audit
+        audit.record(conn, "deploy.rollback" if is_rollback else "deploy.promote",
+                     ctx.customer.id, {"candidate_id": candidate_id, "system": row.system})
 
 
 def maybe_deploy(ctx, new_candidate_id: str, new_system: str = "finetuned",

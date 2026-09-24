@@ -89,7 +89,11 @@ def _save(conn, customer_id: str, stage: str, status: str, state: dict) -> dict:
 def start(conn: sqlite3.Connection, customer_id: str, restart: bool = False, **options) -> dict:
     """Create this customer's pipeline (or, with `restart`, replace a
     finished/failed one). Refuses to clobber one that is still in progress."""
-    CustomerContext(conn, customer_id)  # raises UnknownCustomerError early
+    ctx = CustomerContext(conn, customer_id)  # raises UnknownCustomerError early
+    if not ctx.profile.supports_generation() and not ctx.imported_corpus_path().exists():
+        raise PipelineError(
+            f"{customer_id!r} is on a workload with no synthetic data (a custom schema) and has "
+            f"no imported corpus -- run `ftplatform customer import {customer_id} <file>` first.")
     unknown = set(options) - set(DEFAULT_OPTIONS)
     if unknown:
         raise ValueError(f"unknown pipeline option(s): {sorted(unknown)}")

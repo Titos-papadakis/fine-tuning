@@ -102,6 +102,28 @@ def scan(text: str, rules: tuple, context: str = "") -> list:
     return findings
 
 
+def redact(text: str, rules: tuple) -> str:
+    """`text` with every finding scan() would report replaced by
+    "[REDACTED:<rule>]" -- the same Luhn/test-PAN filtering applies, so an
+    order id is never mistaken for a card number and blanked."""
+    if not text:
+        return text
+    for f in sorted(scan(text, rules), key=lambda f: len(f.value), reverse=True):
+        text = text.replace(f.value, f"[REDACTED:{f.rule}]")
+    return text
+
+
+def redact_value(value, rules: tuple):
+    """redact() applied to every string inside a (nested) dict/list."""
+    if isinstance(value, str):
+        return redact(value, rules)
+    if isinstance(value, dict):
+        return {k: redact_value(v, rules) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_value(v, rules) for v in value]
+    return value
+
+
 def scan_record(record: dict, rules: tuple, prefix: str = "") -> list:
     """Recursively scan every string in a structured record."""
     findings: list = []
