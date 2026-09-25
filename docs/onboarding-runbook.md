@@ -72,8 +72,9 @@ ftplatform audit list acme            # the trail a security reviewer asks for
 
 `docs/security-and-data-handling.md` is the document to send a customer's
 security/procurement team. It lists Kaggle as a subprocessor for training.
-When deleting a customer, also delete their `ftplatform-job-*` datasets and
-notebooks on Kaggle by hand (not yet automatic).
+`customer delete` removes the customer's `ftplatform-job-*` datasets and
+notebooks on Kaggle as well (jobs pushed before this was recorded, such as
+the original `pipeline-test` run, still need deleting by hand).
 
 The numbered sections below are the same flow step by step, for when you
 want to run or re-run one stage by hand.

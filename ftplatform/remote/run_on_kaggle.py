@@ -80,6 +80,12 @@ def start_job_on_kaggle(conn: sqlite3.Connection, customer_id: str, job_id: str,
     slug = f"ftplatform-job-{job_id}"
     dataset_id = kaggle_ops.upload_packet_dataset(
         packet_dir, owner, slug, title=f"ftplatform job {job_id} ({customer_id})", run=run)
+    # Recorded the moment the customer's data exists on Kaggle, before the
+    # kernel push that could still fail -- so deletion finds it either way.
+    conn.execute("INSERT OR REPLACE INTO kaggle_artifacts (customer_id, job_id, dataset_id, "
+                 "kernel_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                 (customer_id, job_id, dataset_id, kernel_id, _now()))
+    conn.commit()
 
     kernel_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(KERNEL_SOURCE_DIR / KERNEL_CODE_FILE, kernel_dir / KERNEL_CODE_FILE)

@@ -248,32 +248,54 @@ def customer_delete(
     yes: bool = typer.Option(False, "--yes", help="Actually delete. Without it, only shows "
                                                  "what would be removed."),
     force: bool = typer.Option(False, help="Delete even with a live Stripe subscription."),
+    skip_kaggle: bool = typer.Option(
+        False, help="Don't delete the customer's private datasets/kernels on Kaggle (do it by "
+                    "hand). Without this, a Kaggle failure stops the deletion before anything "
+                    "local is removed, so it can be retried."),
 ):
-    """Remove a customer completely: database rows, customers/<id>/ (data,
-    models, logs) and its Kaggle staging dirs. Irreversible -- take a
-    `db backup` first if in doubt."""
+    """Remove a customer completely: their private Kaggle datasets/kernels,
+    database rows, customers/<id>/ (data, models, logs) and local staging
+    dirs. Irreversible -- take a `db backup` first if in doubt."""
     from ftplatform.jobs import queue
+    from ftplatform.remote import kaggle_ops
 
     conn = connect()
     try:
         ctx = _ctx_or_exit(conn, customer_id)
+        n_remote = conn.execute("SELECT COUNT(*) FROM kaggle_artifacts WHERE customer_id = ?",
+                                (customer_id,)).fetchone()[0]
         if not yes:
             n_jobs = len(queue.list_jobs(conn, customer_id))
             typer.echo(f"\nwould delete {customer_id!r} ({ctx.customer.name}): {n_jobs} job(s), "
-                       f"every db row, and {ctx.customer_root()}")
+                       f"{n_remote} Kaggle job artefact set(s), every db row, and "
+                       f"{ctx.customer_root()}")
             typer.echo("re-run with --yes to do it.")
             return
-        try:
-            result = store.delete(conn, customer_id, force=force)
-        except store.CustomerHasLiveSubscriptionError as e:
-            typer.secho(str(e), fg=typer.colors.RED, err=True)
-            raise typer.Exit(code=1) from e
+        if store.billable(conn, customer_id) and not force:
+            typer.secho(f"{customer_id!r} still has a billable Stripe subscription -- cancel it in "
+                        f"Stripe first, or pass --force.", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+        remote = None
+        if n_remote and not skip_kaggle:
+            try:
+                remote = kaggle_ops.delete_job_artifacts(conn, customer_id)
+            except kaggle_ops.KaggleCommandError as e:
+                typer.secho(f"Kaggle deletion failed -- nothing local was deleted, retry "
+                            f"later:\n{e}", fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1) from e
+        result = store.delete(conn, customer_id, force=force)
+        if remote:
+            audit.record(conn, "kaggle.delete", customer_id, remote)
     finally:
         conn.close()
 
     rows = sum(result["rows"].values())
     typer.secho(f"\ndeleted {customer_id!r}: {rows} db row(s), {len(result['paths'])} "
-                f"director(ies).", fg=typer.colors.GREEN)
+                f"director(ies)" + (f", {remote['deleted']} Kaggle dataset(s)/kernel(s)"
+                                    if remote else "") + ".", fg=typer.colors.GREEN)
+    if n_remote and skip_kaggle:
+        typer.secho("  Kaggle artefacts were NOT deleted (--skip-kaggle) -- remove the "
+                    "ftplatform-job-* datasets/notebooks by hand.", fg=typer.colors.YELLOW)
 
 
 @baseline_app.command("run")

@@ -209,6 +209,48 @@ def kernel_status(kernel_id: str, run=subprocess.run) -> str:
     return _parse_kernel_status(result.stdout)
 
 
+def _gone(message: str) -> bool:
+    """Kaggle's wording for "nothing to delete": a 404, or -- for a private
+    slug that no longer exists -- the same permission error kernel_status()
+    sees for a never-pushed kernel."""
+    m = message.lower()
+    return "404" in m or "not found" in m or ("denied" in m and ".get" in m) or "does not exist" in m
+
+
+def delete_remote(kind: str, ref: str, run=subprocess.run) -> bool:
+    """Delete one dataset or kernel. True if deleted, False if it was already
+    gone; any other failure raises, so a caller never mistakes "Kaggle was
+    unreachable" for "the customer's data is gone"."""
+    if kind not in ("datasets", "kernels"):
+        raise ValueError(f"kind must be 'datasets' or 'kernels', got {kind!r}")
+    try:
+        _kaggle([kind, "delete", ref, "-y"], run=run)
+    except KaggleCommandError as e:
+        if _gone(str(e)):
+            return False
+        raise
+    return True
+
+
+def delete_job_artifacts(conn, customer_id: str, run=subprocess.run) -> dict:
+    """Removes every kernel and dataset recorded for `customer_id` -- kernel
+    first, since it mounts the dataset. Stops at the first real failure,
+    leaving the remaining rows in place so the deletion can be retried."""
+    rows = conn.execute("SELECT job_id, dataset_id, kernel_id FROM kaggle_artifacts "
+                        "WHERE customer_id = ?", (customer_id,)).fetchall()
+    deleted = already_gone = 0
+    for r in rows:
+        for kind, ref in (("kernels", r["kernel_id"]), ("datasets", r["dataset_id"])):
+            if delete_remote(kind, ref, run=run):
+                deleted += 1
+            else:
+                already_gone += 1
+        conn.execute("DELETE FROM kaggle_artifacts WHERE customer_id = ? AND job_id = ?",
+                     (customer_id, r["job_id"]))
+        conn.commit()
+    return {"jobs": len(rows), "deleted": deleted, "already_gone": already_gone}
+
+
 # The kaggle CLI writes a kernel's log with a bare open() -- the locale
 # encoding, cp1253 on a Greek Windows box -- and crashes with
 # UnicodeEncodeError on any emoji in it (Unsloth prints one every run).

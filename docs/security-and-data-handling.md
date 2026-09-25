@@ -96,15 +96,16 @@ dedicated compute instead. This must be agreed before onboarding.
 
 ## 7. Deletion
 
-On request, a single operation removes the customer's database rows (except
-the audit log), their entire customer directory (data, models, logs,
-reports) and local job staging files. It is refused while a Stripe
-subscription is still billable, so that deleting the records cannot hide
-live charges.
+On request, a single operation removes the private Kaggle datasets and job
+notebooks created for the customer's training jobs (§4), the customer's
+database rows (except the audit log), their entire customer directory
+(data, models, logs, reports) and local job staging files.
 
-**Manual step today:** the private Kaggle datasets and job notebooks created
-for the customer's training jobs (§4) are removed by hand as part of the same
-deletion request. They are not yet deleted automatically.
+- Kaggle copies are removed first. If Kaggle cannot be reached, nothing
+  local is deleted, so the deletion can be retried safely and is never left
+  half done.
+- Deletion is refused while a Stripe subscription is still billable, so
+  deleting the records cannot hide live charges.
 
 ## 8. Backups
 
@@ -122,4 +123,3 @@ Stated plainly, so nothing here is assumed:
   service.
 - Isolation is application-level (§2), not per-customer infrastructure.
   Dedicated infrastructure is available by agreement.
-- Kaggle-side artefacts are deleted manually (§7).

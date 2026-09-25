@@ -128,6 +128,18 @@ CREATE TABLE IF NOT EXISTS pipelines (
     updated_at    TEXT NOT NULL
 );
 
+-- Every private dataset/kernel a job created on Kaggle, recorded at push
+-- time so `customer delete` can remove them there too -- they hold a copy
+-- of the customer's data (see docs/security-and-data-handling.md §4).
+CREATE TABLE IF NOT EXISTS kaggle_artifacts (
+    customer_id   TEXT NOT NULL REFERENCES customers(id),
+    job_id        TEXT NOT NULL,
+    dataset_id    TEXT NOT NULL,
+    kernel_id     TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (customer_id, job_id)
+);
+
 -- Append-only; see ftplatform/audit.py. No FK on customer_id on purpose: the
 -- record of a customer's deletion must outlive the customer row.
 CREATE TABLE IF NOT EXISTS audit_log (

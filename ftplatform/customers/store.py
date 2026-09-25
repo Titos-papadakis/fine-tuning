@@ -39,12 +39,18 @@ def list_all(conn: sqlite3.Connection) -> list[Customer]:
 
 # Every table carrying a customer_id, children before `customers` itself.
 CUSTOMER_TABLES = ("deployments", "jobs", "approvals", "candidate_stats", "api_keys",
-                   "usage_counters", "billing_accounts", "pipelines")
+                   "usage_counters", "billing_accounts", "pipelines", "kaggle_artifacts")
 BILLABLE_STATUSES = {"active", "trialing", "past_due", "unpaid"}
 
 
 class CustomerHasLiveSubscriptionError(ValueError):
     pass
+
+
+def billable(conn: sqlite3.Connection, customer_id: str) -> bool:
+    row = conn.execute("SELECT status FROM billing_accounts WHERE customer_id = ?",
+                       (customer_id,)).fetchone()
+    return row is not None and row["status"] in BILLABLE_STATUSES
 
 
 def delete(conn: sqlite3.Connection, customer_id: str, repo_root: Path | None = None,
@@ -60,12 +66,10 @@ def delete(conn: sqlite3.Connection, customer_id: str, repo_root: Path | None = 
 
     if get(conn, customer_id) is None:
         raise ValueError(f"no such customer: {customer_id!r}")
-    billing = conn.execute("SELECT status FROM billing_accounts WHERE customer_id = ?",
-                           (customer_id,)).fetchone()
-    if billing is not None and billing["status"] in BILLABLE_STATUSES and not force:
+    if billable(conn, customer_id) and not force:
         raise CustomerHasLiveSubscriptionError(
-            f"{customer_id!r} has a {billing['status']!r} Stripe subscription -- cancel it in "
-            f"Stripe first (deleting here would not stop the charges), or pass force.")
+            f"{customer_id!r} has a billable Stripe subscription -- cancel it in Stripe first "
+            f"(deleting here would not stop the charges), or pass force.")
 
     root = Path(repo_root) if repo_root is not None else config_mod.REPO_ROOT
     job_ids = [r["id"] for r in conn.execute("SELECT id FROM jobs WHERE customer_id = ?",
