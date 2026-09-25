@@ -1,0 +1,155 @@
+{
+  "name": "returns_refunds",
+  "title": "Returns & refunds",
+  "description": "Returns for size, colour or damage; refund requests, status and changes; price disputes, wrong charges and promo codes.",
+  "source": "ABCD, ASAPP Research (MIT licence) -- https://github.com/asappresearch/abcd",
+  "intents": [
+    "bad_price_competitor",
+    "bad_price_yesterday",
+    "mistimed_billing_already_returned",
+    "mistimed_billing_never_bought",
+    "out_of_stock_general",
+    "out_of_stock_one_item",
+    "promo_code_invalid",
+    "promo_code_out_of_date",
+    "refund_initiate",
+    "refund_status",
+    "refund_update",
+    "return_color",
+    "return_size",
+    "return_stain"
+  ],
+  "policy": "Required actions per intent, in order -- bad_price_competitor: pull-up-account > record-reason > verify-identity > promo-code; bad_price_yesterday: pull-up-account > record-reason > verify-identity > promo-code; mistimed_billing_already_returned: pull-up-account > validate-purchase > record-reason > membership > update-order; mistimed_billing_never_bought: pull-up-account > validate-purchase > ask-the-oracle > membership > update-order; out_of_stock_general: pull-up-account > notify-team > promo-code; out_of_stock_one_item: pull-up-account > record-reason > notify-team > make-purchase; promo_code_invalid: pull-up-account > ask-the-oracle > membership > promo-code; promo_code_out_of_date: pull-up-account > ask-the-oracle > membership > promo-code; refund_initiate: pull-up-account > validate-purchase > record-reason > enter-details > offer-refund; refund_status: pull-up-account > validate-purchase > notify-team > update-order; refund_update: pull-up-account > validate-purchase > record-reason > offer-refund; return_color: pull-up-account > validate-purchase > membership > enter-details > update-order; return_size: pull-up-account > validate-purchase > membership > enter-details > update-order; return_stain: pull-up-account > validate-purchase > membership > enter-details > update-order",
+  "tools": [
+    {
+      "name": "ask-the-oracle",
+      "description": "Look up or verify",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Querying the system for an answer ..."
+      }
+    },
+    {
+      "name": "enter-details",
+      "description": "Change or record",
+      "args": "details_slotval / full_address / account_id / username / email / pin_number / security_answer",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Details of {0} have been entered."
+      }
+    },
+    {
+      "name": "make-purchase",
+      "description": "Change or record",
+      "args": "product",
+      "permission": "approval",
+      "handler": {
+        "type": "mock",
+        "template": "A purchase of {0} was made."
+      }
+    },
+    {
+      "name": "membership",
+      "description": "Answer from the FAQ / policy",
+      "args": "membership_level",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Membership level of {0} has been noted."
+      }
+    },
+    {
+      "name": "notify-team",
+      "description": "Change or record",
+      "args": "company_team",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "The {0} has been notified."
+      }
+    },
+    {
+      "name": "offer-refund",
+      "description": "Change or record",
+      "args": "amount",
+      "permission": "approval",
+      "handler": {
+        "type": "mock",
+        "template": "A refund has been made for the amount of ${0}."
+      }
+    },
+    {
+      "name": "promo-code",
+      "description": "Look up or verify",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "A promo code has been created."
+      }
+    },
+    {
+      "name": "pull-up-account",
+      "description": "Change or record",
+      "args": "customer_name / account_id",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Account has been pulled up for {0}."
+      }
+    },
+    {
+      "name": "record-reason",
+      "description": "Change or record",
+      "args": "reason_slotval / product / street_address / customer_name / payment_method / phone / refund_target",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "A reason of {0} has been recorded."
+      }
+    },
+    {
+      "name": "search-faq",
+      "description": "Answer from the FAQ / policy",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Searching the FAQ pages ..."
+      }
+    },
+    {
+      "name": "update-order",
+      "description": "Change or record",
+      "args": "order_slotval / change_option / amount / payment_method / full_address",
+      "permission": "approval",
+      "handler": {
+        "type": "mock",
+        "template": "Order has been updated with {0}."
+      }
+    },
+    {
+      "name": "validate-purchase",
+      "description": "Look up or verify",
+      "args": "username / email / order_id",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Purchase validation in progress ..."
+      }
+    },
+    {
+      "name": "verify-identity",
+      "description": "Look up or verify",
+      "args": "customer_name / account_id / order_id / zip_code",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Identity verification in progress ..."
+      }
+    }
+  ]
+}

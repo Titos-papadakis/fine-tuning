@@ -84,6 +84,9 @@ agent_app.add_typer(agent_tools_app, name="tools")
 agent_kb_app = typer.Typer(help="Documents the agent can search (knowledge_search tool).",
                            no_args_is_help=True)
 agent_app.add_typer(agent_kb_app, name="knowledge")
+agent_packs_app = typer.Typer(help="Ready-made process packs (returns, orders, account, ...).",
+                              no_args_is_help=True)
+agent_app.add_typer(agent_packs_app, name="packs")
 
 
 def _ctx_or_exit(conn, customer_id: str) -> CustomerContext:
@@ -2128,6 +2131,67 @@ def agent_approve(customer_id: str = typer.Argument(...), action_id: str = typer
 def agent_reject(customer_id: str = typer.Argument(...), action_id: str = typer.Argument(...)):
     """Reject a pending action."""
     _agent_decide(customer_id, action_id, False)
+
+
+@agent_packs_app.command("list")
+def agent_packs_list():
+    """The ready-made process packs."""
+    from ftplatform.agent import packs
+
+    for p in packs.available():
+        typer.echo(f"\n  {p['name']:<22} {p['title']}")
+        typer.echo(f"  {'':<22} {p['description']}")
+        typer.echo(f"  {'':<22} {len(p['intents'])} intents, {len(p['tools'])} tools")
+    typer.echo("")
+
+
+@agent_packs_app.command("export")
+def agent_packs_export(
+    names: list[str] = typer.Argument(..., help="One or more pack names."),
+    out_dir: Path = typer.Option(Path("."), "--out-dir", "-o"),
+    endpoint: str | None = typer.Option(
+        None, help="Base URL of the customer's tool endpoints; each tool posts to <endpoint>/<tool>."),
+    secret_env: str | None = typer.Option(None, help="Env var holding their endpoint's bearer token."),
+):
+    """Write tools.json + step_schema.json for these packs -- the two files a new agent customer needs."""
+    import json as json_mod
+
+    from ftplatform.agent import packs
+    from ftplatform.agent import tools as tools_mod
+
+    try:
+        catalog, intents = packs.combine(names, endpoint=endpoint, secret_env=secret_env)
+    except (KeyError, ValueError) as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "tools.json").write_text(json_mod.dumps(catalog, indent=2), encoding="utf-8")
+    (out_dir / "step_schema.json").write_text(
+        json_mod.dumps(tools_mod.step_schema(catalog, intents=intents), indent=2), encoding="utf-8")
+    typer.secho(f"\n{len(catalog['tools'])} tools, {len(intents)} intents -> {out_dir}/tools.json, "
+                f"{out_dir}/step_schema.json (mode dry_run)\n", fg=typer.colors.GREEN)
+    typer.echo(f"  ftplatform customer add <id> --name ... --workload custom "
+               f"--schema {out_dir / 'step_schema.json'}")
+    typer.echo(f"  ftplatform agent tools install <id> {out_dir / 'tools.json'}\n")
+
+
+@agent_packs_app.command("score")
+def agent_packs_score(
+    schema: Path = typer.Argument(..., exists=True, help="The step schema the run used."),
+    eval_jsonl: Path = typer.Argument(..., exists=True),
+    raw_jsonl: Path = typer.Argument(..., exists=True, help="raw_<system>.jsonl from the run's reports."),
+):
+    """Per-pack accuracy of one benchmarked system."""
+    from ftplatform.agent import packs
+    from ftspec.core.registry import read_custom_schema
+
+    contract, _ = read_custom_schema(schema)
+    rows = packs.score_files(eval_jsonl, raw_jsonl, contract)
+    typer.echo(f"\n  {'pack':<22} {'steps':>5} {'next step':>10} {'actions':>8} {'right action':>13}")
+    for name, r in rows.items():
+        act = f"{r['action_pct']}%" if r["action_pct"] is not None else "-"
+        typer.echo(f"  {name:<22} {r['steps']:>5} {r['next_step_pct']:>9}% {r['actions']:>8} {act:>13}")
+    typer.echo("")
 
 
 if __name__ == "__main__":

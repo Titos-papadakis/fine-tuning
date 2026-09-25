@@ -1,0 +1,127 @@
+{
+  "name": "billing_subscriptions",
+  "title": "Billing & subscriptions",
+  "description": "Amount and date due, paying a bill, extensions, disputed subscription charges.",
+  "source": "ABCD, ASAPP Research (MIT licence) -- https://github.com/asappresearch/abcd",
+  "intents": [
+    "manage_dispute_bill",
+    "manage_extension",
+    "manage_pay_bill",
+    "status_due_amount",
+    "status_due_date",
+    "status_questions"
+  ],
+  "policy": "Required actions per intent, in order -- manage_dispute_bill: pull-up-account > verify-identity > membership > ask-the-oracle > offer-refund; manage_extension: pull-up-account > verify-identity > membership > update-account > enter-details; manage_pay_bill: pull-up-account > verify-identity > subscription-status > enter-details > update-account; status_due_amount: pull-up-account > verify-identity > subscription-status > send-link > enter-details; status_due_date: pull-up-account > verify-identity > subscription-status > send-link > enter-details",
+  "tools": [
+    {
+      "name": "ask-the-oracle",
+      "description": "Look up or verify",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Querying the system for an answer ..."
+      }
+    },
+    {
+      "name": "enter-details",
+      "description": "Change or record",
+      "args": "details_slotval / full_address / account_id / username / email / pin_number / security_answer",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Details of {0} have been entered."
+      }
+    },
+    {
+      "name": "membership",
+      "description": "Answer from the FAQ / policy",
+      "args": "membership_level",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Membership level of {0} has been noted."
+      }
+    },
+    {
+      "name": "notify-team",
+      "description": "Change or record",
+      "args": "company_team",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "The {0} has been notified."
+      }
+    },
+    {
+      "name": "offer-refund",
+      "description": "Change or record",
+      "args": "amount",
+      "permission": "approval",
+      "handler": {
+        "type": "mock",
+        "template": "A refund has been made for the amount of ${0}."
+      }
+    },
+    {
+      "name": "pull-up-account",
+      "description": "Change or record",
+      "args": "customer_name / account_id",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Account has been pulled up for {0}."
+      }
+    },
+    {
+      "name": "search-faq",
+      "description": "Answer from the FAQ / policy",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Searching the FAQ pages ..."
+      }
+    },
+    {
+      "name": "send-link",
+      "description": "Change or record",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "A link will be sent."
+      }
+    },
+    {
+      "name": "subscription-status",
+      "description": "Look up or verify",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Querying the system for subscription status ..."
+      }
+    },
+    {
+      "name": "update-account",
+      "description": "Change or record",
+      "args": "account_slotval / street_address / customer_name / payment_method / phone",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Account has been updated with {0}."
+      }
+    },
+    {
+      "name": "verify-identity",
+      "description": "Look up or verify",
+      "args": "customer_name / account_id / order_id / zip_code",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Identity verification in progress ..."
+      }
+    }
+  ]
+}

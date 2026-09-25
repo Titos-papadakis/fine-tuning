@@ -1,0 +1,144 @@
+{
+  "name": "orders_shipping",
+  "title": "Orders & shipping",
+  "description": "Where is my order, delivery dates, missing packages, shipping cost; creating, cancelling, upgrading and changing orders.",
+  "source": "ABCD, ASAPP Research (MIT licence) -- https://github.com/asappresearch/abcd",
+  "intents": [
+    "cost",
+    "manage",
+    "manage_cancel",
+    "manage_create",
+    "manage_downgrade",
+    "manage_upgrade",
+    "missing",
+    "status",
+    "status_delivery_date",
+    "status_delivery_time",
+    "status_mystery_fee",
+    "status_payment_method",
+    "status_quantity"
+  ],
+  "policy": "Required actions per intent, in order -- cost: pull-up-account > validate-purchase > shipping-status > update-order > offer-refund; manage: pull-up-account > shipping-status > validate-purchase > update-order; manage_cancel: pull-up-account > verify-identity > shipping-status > membership > offer-refund; manage_create: pull-up-account > verify-identity > shipping-status > membership > make-purchase; manage_downgrade: pull-up-account > verify-identity > shipping-status > membership > update-order; manage_upgrade: pull-up-account > verify-identity > shipping-status > membership > update-order; missing: pull-up-account > validate-purchase > record-reason > update-order > make-purchase; status: pull-up-account > verify-identity > validate-purchase > ask-the-oracle > update-order; status_delivery_time: pull-up-account > verify-identity > ask-the-oracle > shipping-status > update-order; status_mystery_fee: pull-up-account > verify-identity > ask-the-oracle > membership > update-order; status_payment_method: pull-up-account > verify-identity > shipping-status > update-order; status_quantity: pull-up-account > verify-identity > ask-the-oracle > shipping-status > offer-refund",
+  "tools": [
+    {
+      "name": "ask-the-oracle",
+      "description": "Look up or verify",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Querying the system for an answer ..."
+      }
+    },
+    {
+      "name": "make-purchase",
+      "description": "Change or record",
+      "args": "product",
+      "permission": "approval",
+      "handler": {
+        "type": "mock",
+        "template": "A purchase of {0} was made."
+      }
+    },
+    {
+      "name": "membership",
+      "description": "Answer from the FAQ / policy",
+      "args": "membership_level",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Membership level of {0} has been noted."
+      }
+    },
+    {
+      "name": "notify-team",
+      "description": "Change or record",
+      "args": "company_team",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "The {0} has been notified."
+      }
+    },
+    {
+      "name": "offer-refund",
+      "description": "Change or record",
+      "args": "amount",
+      "permission": "approval",
+      "handler": {
+        "type": "mock",
+        "template": "A refund has been made for the amount of ${0}."
+      }
+    },
+    {
+      "name": "pull-up-account",
+      "description": "Change or record",
+      "args": "customer_name / account_id",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Account has been pulled up for {0}."
+      }
+    },
+    {
+      "name": "record-reason",
+      "description": "Change or record",
+      "args": "reason_slotval / product / street_address / customer_name / payment_method / phone / refund_target",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "A reason of {0} has been recorded."
+      }
+    },
+    {
+      "name": "search-faq",
+      "description": "Answer from the FAQ / policy",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Searching the FAQ pages ..."
+      }
+    },
+    {
+      "name": "shipping-status",
+      "description": "Change or record",
+      "args": "shipping_option",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Shipping status of {0} has been noted."
+      }
+    },
+    {
+      "name": "update-order",
+      "description": "Change or record",
+      "args": "order_slotval / change_option / amount / payment_method / full_address",
+      "permission": "approval",
+      "handler": {
+        "type": "mock",
+        "template": "Order has been updated with {0}."
+      }
+    },
+    {
+      "name": "validate-purchase",
+      "description": "Look up or verify",
+      "args": "username / email / order_id",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Purchase validation in progress ..."
+      }
+    },
+    {
+      "name": "verify-identity",
+      "description": "Look up or verify",
+      "args": "customer_name / account_id / order_id / zip_code",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Identity verification in progress ..."
+      }
+    }
+  ]
+}

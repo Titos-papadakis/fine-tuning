@@ -1,0 +1,142 @@
+{
+  "name": "account_access",
+  "title": "Account & access",
+  "description": "Password and username recovery, two-factor reset; changing name, address, phone or payment method.",
+  "source": "ABCD, ASAPP Research (MIT licence) -- https://github.com/asappresearch/abcd",
+  "intents": [
+    "manage_change_address",
+    "manage_change_name",
+    "manage_change_phone",
+    "manage_payment_method",
+    "recover_password",
+    "recover_username",
+    "reset_2fa",
+    "status_credit_missing",
+    "status_service_added",
+    "status_service_removed",
+    "status_shipping_question"
+  ],
+  "policy": "Required actions per intent, in order -- manage_change_address: pull-up-account > record-reason > verify-identity > update-account; manage_change_name: pull-up-account > record-reason > verify-identity > update-account; manage_change_phone: pull-up-account > record-reason > verify-identity > update-account; manage_payment_method: pull-up-account > record-reason > verify-identity > update-account; recover_password: pull-up-account > enter-details > make-password; recover_username: pull-up-account > verify-identity; reset_2fa: pull-up-account > enter-details > send-link; status_credit_missing: pull-up-account > record-reason > ask-the-oracle > promo-code; status_service_added: pull-up-account > record-reason > ask-the-oracle > update-account > offer-refund; status_service_removed: pull-up-account > record-reason > ask-the-oracle > update-account; status_shipping_question: pull-up-account > ask-the-oracle > send-link",
+  "tools": [
+    {
+      "name": "ask-the-oracle",
+      "description": "Look up or verify",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Querying the system for an answer ..."
+      }
+    },
+    {
+      "name": "enter-details",
+      "description": "Change or record",
+      "args": "details_slotval / full_address / account_id / username / email / pin_number / security_answer",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Details of {0} have been entered."
+      }
+    },
+    {
+      "name": "make-password",
+      "description": "Look up or verify",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "A password has been generated."
+      }
+    },
+    {
+      "name": "notify-team",
+      "description": "Change or record",
+      "args": "company_team",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "The {0} has been notified."
+      }
+    },
+    {
+      "name": "offer-refund",
+      "description": "Change or record",
+      "args": "amount",
+      "permission": "approval",
+      "handler": {
+        "type": "mock",
+        "template": "A refund has been made for the amount of ${0}."
+      }
+    },
+    {
+      "name": "promo-code",
+      "description": "Look up or verify",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "A promo code has been created."
+      }
+    },
+    {
+      "name": "pull-up-account",
+      "description": "Change or record",
+      "args": "customer_name / account_id",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Account has been pulled up for {0}."
+      }
+    },
+    {
+      "name": "record-reason",
+      "description": "Change or record",
+      "args": "reason_slotval / product / street_address / customer_name / payment_method / phone / refund_target",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "A reason of {0} has been recorded."
+      }
+    },
+    {
+      "name": "search-faq",
+      "description": "Answer from the FAQ / policy",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Searching the FAQ pages ..."
+      }
+    },
+    {
+      "name": "send-link",
+      "description": "Change or record",
+      "args": "",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "A link will be sent."
+      }
+    },
+    {
+      "name": "update-account",
+      "description": "Change or record",
+      "args": "account_slotval / street_address / customer_name / payment_method / phone",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Account has been updated with {0}."
+      }
+    },
+    {
+      "name": "verify-identity",
+      "description": "Look up or verify",
+      "args": "customer_name / account_id / order_id / zip_code",
+      "permission": "auto",
+      "handler": {
+        "type": "mock",
+        "template": "Identity verification in progress ..."
+      }
+    }
+  ]
+}

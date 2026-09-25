@@ -513,3 +513,79 @@ def test_abcd_decision_points_skip_before_the_customer_speaks():
              {"role": "customer", "text": "refund"}, {"role": "action", "tool": "x", "args": []},
              {"role": "customer", "text": "ok"}]
     assert abcd.decision_points(turns) == {"action": [3], "reply": [], "wait": [4]}
+
+
+# --- process packs ------------------------------------------------------------------
+
+def test_shipped_packs_are_valid_catalogs_with_disjoint_intents():
+    from ftplatform.agent import packs
+
+    shipped = packs.available()
+    assert {p["name"] for p in shipped} == set(packs.DEFINITIONS)
+    seen: set = set()
+    for p in shipped:
+        tools_mod.validate({"tools": p["tools"]})
+        assert p["intents"] and not (seen & set(p["intents"]))
+        seen |= set(p["intents"])
+        assert "ABCD" in p["source"]
+
+
+def test_combine_merges_packs_and_points_tools_at_the_customer():
+    from ftplatform.agent import packs
+
+    catalog, intents = packs.combine(["returns_refunds", "product_questions"],
+                                     endpoint="https://acme.example/agent/", secret_env="ACME_TOKEN")
+    names = [t["name"] for t in catalog["tools"]]
+    assert len(names) == len(set(names)) and catalog["mode"] == "dry_run"
+    refund = tools_mod.tool(catalog, "offer-refund")
+    assert refund["handler"] == {"type": "http", "url": "https://acme.example/agent/offer-refund",
+                                 "secret_env": "ACME_TOKEN"}
+    assert refund["permission"] == "approval"
+    assert tools_mod.tool(catalog, "knowledge-search")["handler"]["type"] == "knowledge_search"
+    assert "refund_initiate" in intents
+    with pytest.raises(KeyError):
+        packs.combine(["nope"])
+
+
+def test_breakdown_scores_each_pack():
+    from ftplatform.agent import packs
+
+    refund = json.loads(step("action", "offer-refund", ["40"], intent="refund_initiate"))
+    wait = json.loads(step("wait", intent="recover_password"))
+    pairs = [(refund, refund), (refund, {**refund, "args": ["41"]}), (wait, wait), (wait, None)]
+    b = packs.breakdown(pairs)
+    assert b["returns_refunds"]["action_pct"] == 50.0 and b["returns_refunds"]["next_step_pct"] == 100.0
+    assert b["account_access"]["next_step_pct"] == 50.0 and b["account_access"]["action_pct"] is None
+
+
+def test_packs_export_writes_what_customer_add_needs(root):
+    out = root / "acme_agent"
+    r = CliRunner().invoke(app, ["agent", "packs", "export", "orders_shipping", "-o", str(out)])
+    assert r.exit_code == 0, r.output
+    r = CliRunner().invoke(app, ["customer", "add", "acme", "--name", "Acme", "--workload", "custom",
+                                 "--schema", str(out / "step_schema.json")])
+    assert r.exit_code == 0, r.output
+    r = CliRunner().invoke(app, ["agent", "tools", "install", "acme", str(out / "tools.json")])
+    assert r.exit_code == 0, r.output
+
+
+def test_packs_score_pairs_eval_rows_with_raw_outputs(tmp_path):
+    from ftplatform.agent import packs
+
+    schema = tmp_path / "s.json"
+    catalog = {"tools": [{"name": "offer-refund", "permission": "auto"}]}
+    schema.write_text(json.dumps(tools_mod.step_schema(catalog, intents=["refund_initiate"])),
+                      encoding="utf-8")
+    gold = step("action", "offer-refund", ["40"], intent="refund_initiate")
+    (tmp_path / "eval.jsonl").write_text(
+        "\n".join(json.dumps({"messages": [{}, {}, {"content": gold}]}) for _ in range(2)),
+        encoding="utf-8")
+    (tmp_path / "raw.jsonl").write_text(
+        json.dumps({"output": gold}) + "\n" + json.dumps({"output": "garbage"}), encoding="utf-8")
+    r = CliRunner().invoke(app, ["agent", "packs", "score", str(schema), str(tmp_path / "eval.jsonl"),
+                                 str(tmp_path / "raw.jsonl")])
+    assert r.exit_code == 0, r.output
+    assert "returns_refunds" in r.output and "50.0%" in r.output
+    contract = load_profile("custom", schema_path=schema).contract
+    assert packs.score_files(tmp_path / "eval.jsonl", tmp_path / "raw.jsonl",
+                             contract)["returns_refunds"]["action_ok"] == 1

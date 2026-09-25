@@ -67,6 +67,9 @@ ftplatform = "ftplatform.cli:app"
 [tool.setuptools.packages.find]
 include = ["ftspec*", "profiles*", "ftplatform*"]
 
+[tool.setuptools.package-data]
+"ftplatform.agent" = ["packs/*.json"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
