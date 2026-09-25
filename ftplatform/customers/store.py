@@ -39,7 +39,8 @@ def list_all(conn: sqlite3.Connection) -> list[Customer]:
 
 # Every table carrying a customer_id, children before `customers` itself.
 CUSTOMER_TABLES = ("deployments", "jobs", "approvals", "candidate_stats", "api_keys",
-                   "usage_counters", "billing_accounts", "pipelines", "kaggle_artifacts")
+                   "usage_counters", "billing_accounts", "pipelines", "kaggle_artifacts",
+                   "agent_actions")
 BILLABLE_STATUSES = {"active", "trialing", "past_due", "unpaid"}
 
 

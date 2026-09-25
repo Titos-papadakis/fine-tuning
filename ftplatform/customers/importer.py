@@ -28,6 +28,10 @@ MIN_RECOMMENDED_ROWS = 200
 REVIEW_SAMPLE_SIZE = 20
 TEXT_KEYS = ("input", "text", "ticket", "body", "message")
 OUTPUT_KEYS = ("output", "label_json", "label")
+# Which source a row came from, when several rows share one: a ticket thread,
+# the steps of one conversation. Kept as meta["group"] so the split never puts
+# one source in both train and eval (ftspec.data.build.split_by_group).
+GROUP_KEYS = ("group", "conversation_id", "thread_id", "ticket_id")
 
 
 def _norm(text: str) -> str:
@@ -42,7 +46,7 @@ def _pick(row: dict, keys: tuple) -> str | None:
 
 
 def read_raw_rows(path: Path) -> list[dict]:
-    """[{"text": str, "output": dict | str | None}] from a .jsonl or .csv file.
+    """[{"text": str, "output": dict | str | None, "meta": dict}] from a .jsonl or .csv file.
 
     Accepts the engine's own chat format, a flat input/output shape, or any
     obvious text column name (see TEXT_KEYS) -- a customer's export should not
@@ -65,10 +69,15 @@ def read_raw_rows(path: Path) -> list[dict]:
 
     rows = []
     for r in raw:
+        meta = dict(r["meta"]) if isinstance(r.get("meta"), dict) else {}
+        group = _pick(r, GROUP_KEYS)
+        if group is not None:
+            meta["group"] = str(group)
         if "messages" in r:
-            rows.append({"text": r["messages"][1]["content"], "output": r["messages"][2]["content"]})
+            rows.append({"text": r["messages"][1]["content"],
+                         "output": r["messages"][2]["content"], "meta": meta})
             continue
-        rows.append({"text": _pick(r, TEXT_KEYS), "output": _pick(r, OUTPUT_KEYS)})
+        rows.append({"text": _pick(r, TEXT_KEYS), "output": _pick(r, OUTPUT_KEYS), "meta": meta})
     return rows
 
 
@@ -124,14 +133,15 @@ def import_corpus(ctx, path: Path, labeler: Callable[[str], str] | None = None,
             if record is None:
                 rejected.append({"row": i, "input": text, "reason": f"label invalid: {err}"})
                 continue
-            accepted.append({"input": text, "output": record, "meta": {"label_source": "customer"}})
+            accepted.append({"input": text, "output": record,
+                             "meta": {**row["meta"], "label_source": "customer"}})
             counts["labeled"] += 1
             seen.add(key)
             continue
 
         if labeler is None or (auto_budget is not None and auto_budget <= 0):
             if key not in already_to_label:
-                to_label.append({"row": i, "input": text})
+                to_label.append({"row": i, "input": text, **({"meta": row["meta"]} if row["meta"] else {})})
                 already_to_label.add(key)
             seen.add(key)
             continue
@@ -148,7 +158,8 @@ def import_corpus(ctx, path: Path, labeler: Callable[[str], str] | None = None,
         if record is None:
             rejected.append({"row": i, "input": text, "reason": f"auto-label invalid: {err}"})
             continue
-        item = {"input": text, "output": record, "meta": {"label_source": f"auto:{labeler_name}"}}
+        item = {"input": text, "output": record,
+                "meta": {**row["meta"], "label_source": f"auto:{labeler_name}"}}
         accepted.append(item)
         auto_labeled.append(item)
         counts["auto_labeled"] += 1

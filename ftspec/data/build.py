@@ -129,9 +129,41 @@ def load_external(path: Path, profile: Profile) -> list:
             raise ValueError(
                 f"{path}#{i}: expected either a 'messages' array or 'input'/'output' keys"
             )
-        samples.append(Sample(source_text=source, record=record, meta=row.get("meta", {})))
+        meta = dict(row.get("meta") or {})
+        if row.get("group") is not None:          # the flat shape may name its group directly
+            meta["group"] = str(row["group"])
+        samples.append(Sample(source_text=source, record=record, meta=meta))
     log.info("loaded %d samples from %s", len(samples), path)
     return samples
+
+
+def split_by_group(samples: list, n_eval: int, n_val: int) -> tuple[list, list, list]:
+    """(eval, val, train), keeping every sample of one group in one split.
+
+    A customer corpus is often several rows per source: steps of one
+    conversation, messages of one ticket thread. Splitting those row by row
+    puts near-copies of an eval row into train -- a later step of the same
+    conversation contains the earlier one verbatim -- and the benchmark then
+    measures memory, not skill. Rows name their source in meta["group"];
+    rows without one are each their own group, which reproduces the plain
+    row-order split exactly. Groups are taken in order of first appearance,
+    so the caller's shuffle still decides which ones land in eval.
+    """
+    groups: dict = {}
+    for i, sample in enumerate(samples):
+        key = (sample.meta or {}).get("group")
+        groups.setdefault(("g", key) if key is not None else ("row", i), []).append(sample)
+    evalset: list = []
+    val: list = []
+    train: list = []
+    for members in groups.values():
+        if len(evalset) < n_eval:
+            evalset.extend(members)
+        elif len(val) < n_val:
+            val.extend(members)
+        else:
+            train.extend(members)
+    return evalset, val, train
 
 
 def run(profile: Profile, out_dir: Path, n_train: int = 200, n_val: int = 40,
@@ -146,9 +178,7 @@ def run(profile: Profile, out_dir: Path, n_train: int = 200, n_val: int = 40,
         rng.shuffle(samples)
         n_eval = min(n_eval, max(1, len(samples) // 5))
         n_val = min(n_val, max(1, len(samples) // 10))
-        evalset = samples[:n_eval]
-        val = samples[n_eval:n_eval + n_val]
-        train = samples[n_eval + n_val:]
+        evalset, val, train = split_by_group(samples, n_eval, n_val)
     else:
         if not profile.supports_generation():
             raise ValueError(

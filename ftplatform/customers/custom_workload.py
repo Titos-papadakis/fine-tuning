@@ -18,9 +18,8 @@ import json
 import shutil
 from pathlib import Path
 
-from ftspec.core.contract import Contract
 from ftspec.core.profile import Compliance
-from ftspec.core.registry import CustomProfile
+from ftspec.core.registry import CustomProfile, read_custom_schema
 
 CUSTOM = "custom"
 REGIMES = ("none", "GDPR", "HIPAA", "PCI-DSS")
@@ -37,12 +36,17 @@ def build_profile(schema_path: Path, headline_field: str | None = None,
                   free_text_fields: tuple = (), regime: str = "none",
                   allows_external_api: bool | None = None) -> CustomProfile:
     """Validates everything a later GPU run would otherwise trip over hours in:
-    the schema parses, and every named field actually exists in it."""
+    the schema parses, and every named field actually exists in it. Settings
+    the schema file itself declares (its "x-ftspec" key) apply unless given
+    here explicitly."""
     if regime not in REGIMES:
         raise ValueError(f"regime must be one of {REGIMES}, got {regime!r}")
-    contract = Contract.from_file(Path(schema_path))
+    contract, declared = read_custom_schema(Path(schema_path))
+    headline_field = headline_field or declared.get("headline_field")
+    free_text_fields = tuple(free_text_fields) or tuple(declared.get("free_text_fields", ()))
     profile = CustomProfile(contract, headline_field=headline_field,
-                            free_text_fields=tuple(free_text_fields))
+                            free_text_fields=free_text_fields,
+                            short_prompt=declared.get("short_prompt"))
     paths = set(profile.scoring_plan().paths)
     missing = [f for f in (headline_field, *free_text_fields) if f and f not in paths]
     if missing:
@@ -60,8 +64,8 @@ def install(customer_root: Path, schema_path: Path, **settings) -> CustomProfile
     d = workload_dir(customer_root)
     d.mkdir(parents=True, exist_ok=True)
     shutil.copy(schema_path, d / "schema.json")
-    stored = {"headline_field": settings.get("headline_field"),
-              "free_text_fields": list(settings.get("free_text_fields", ())),
+    stored = {"headline_field": profile.headline_field,
+              "free_text_fields": list(profile.free_text_fields),
               "regime": profile.compliance.regime,
               "allows_external_api": profile.compliance.allows_external_api}
     (d / "workload.json").write_text(json.dumps(stored, indent=2), encoding="utf-8")

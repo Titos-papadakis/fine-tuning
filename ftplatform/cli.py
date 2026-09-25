@@ -76,6 +76,14 @@ app.add_typer(privacy_app, name="privacy")
 audit_app = typer.Typer(help="Who changed what, when -- the append-only audit log.",
                         no_args_is_help=True)
 app.add_typer(audit_app, name="audit")
+agent_app = typer.Typer(help="The customer's model as a support agent: chat plus tool calls.",
+                        no_args_is_help=True)
+app.add_typer(agent_app, name="agent")
+agent_tools_app = typer.Typer(help="The agent's tool catalog and permissions.", no_args_is_help=True)
+agent_app.add_typer(agent_tools_app, name="tools")
+agent_kb_app = typer.Typer(help="Documents the agent can search (knowledge_search tool).",
+                           no_args_is_help=True)
+agent_app.add_typer(agent_kb_app, name="knowledge")
 
 
 def _ctx_or_exit(conn, customer_id: str) -> CustomerContext:
@@ -762,7 +770,7 @@ def serve_customer(
     from ftplatform.serving.hooks import compose
     from ftspec.serving.serve import serve as serve_fn
 
-    conn = connect()
+    conn = connect(shared=True)            # held while serving, used per request
     try:
         try:
             ctx = CustomerContext(conn, customer_id)
@@ -802,13 +810,19 @@ def serve_customer(
             hooks.append(capture_mod.build_hook(ctx))
         import ftspec.serving.serve as serve_mod
         serve_mod.STATE.on_response = compose(*hooks)
+    except BaseException:
+        conn.close()
+        raise
+    # conn stays open while serving: the API-key resolver and the usage hook
+    # query it on every request. (Closing it here made every authenticated
+    # request fail with "Cannot operate on a closed database".)
+    try:
+        serve_fn(model=model, profile=ctx.profile, lora=lora, host=host, port=port,
+                 max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization,
+                 cache_size=cache_size, api_key_resolver=api_key_resolver,
+                 rate_limit_per_min=rate_limit_per_min)
     finally:
         conn.close()
-
-    serve_fn(model=model, profile=ctx.profile, lora=lora, host=host, port=port,
-              max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization,
-              cache_size=cache_size, api_key_resolver=api_key_resolver,
-              rate_limit_per_min=rate_limit_per_min)
 
 
 @review_app.command("scan")
@@ -1298,7 +1312,7 @@ def serve_shared(
                     fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
 
-    conn = connect()
+    conn = connect(shared=True)            # held while serving, used per request
     try:
         adapters = discover_production_adapters(conn, workload)
         if not adapters:
@@ -1344,14 +1358,20 @@ def serve_shared(
             typer.secho("capture disabled: it requires auth to know which customer a "
                          "request belongs to (see --require-auth)", fg=typer.colors.YELLOW)
         serve_mod.STATE.on_response = compose(*hooks)
+    except BaseException:
+        conn.close()
+        raise
+    # conn stays open while serving: the API-key resolver and the usage hook
+    # query it on every request. (Closing it here made every authenticated
+    # request fail with "Cannot operate on a closed database".)
+    try:
+        profile = load_profile(workload)
+        ftspec_serve(base_model, profile, lora=lora, host=host, port=port,
+                     max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization,
+                     max_lora_rank=max_lora_rank, cache_size=cache_size,
+                     api_key_resolver=api_key_resolver, rate_limit_per_min=rate_limit_per_min)
     finally:
         conn.close()
-
-    profile = load_profile(workload)
-    ftspec_serve(base_model, profile, lora=lora, host=host, port=port,
-                 max_model_len=max_model_len, gpu_memory_utilization=gpu_memory_utilization,
-                 max_lora_rank=max_lora_rank, cache_size=cache_size,
-                 api_key_resolver=api_key_resolver, rate_limit_per_min=rate_limit_per_min)
 
 
 @apikey_app.command("create")
@@ -1825,6 +1845,289 @@ def kaggle_watch(
     typer.secho(f"\njob {job['id']!r} ({job['kind']}) -> {job['status']}", fg=color)
     if job["status"] == "failed":
         typer.echo(f"  {job['result']['error']}")
+
+
+# --- agent -------------------------------------------------------------------
+
+@agent_app.command("schema")
+def agent_schema(
+    tools_json: Path = typer.Argument(..., exists=True,
+                                      help="A tool catalog (see ftplatform/agent/tools.py)."),
+    out: Path = typer.Option(Path("agent_schema.json"), "--out", "-o"),
+    intents: str | None = typer.Option(None, help="Comma-separated intents to classify, if any."),
+):
+    """Write the step schema for a catalog, for `customer add --workload custom --schema`."""
+    import json as json_mod
+
+    from ftplatform.agent import tools as tools_mod
+
+    catalog = json_mod.loads(tools_json.read_text(encoding="utf-8"))
+    try:
+        schema = tools_mod.step_schema(
+            catalog, intents=[i.strip() for i in intents.split(",")] if intents else None)
+    except tools_mod.CatalogError as e:
+        typer.secho(str(e), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from e
+    out.write_text(json_mod.dumps(schema, indent=2, ensure_ascii=False), encoding="utf-8")
+    typer.secho(f"wrote {out} ({len(catalog['tools'])} tools)", fg=typer.colors.GREEN)
+
+
+@agent_app.command("build-abcd")
+def agent_build_abcd(
+    src_dir: Path = typer.Argument(..., exists=True, file_okay=False,
+                                   help="Folder with ABCD's abcd_v1.1.json.gz, kb.json, ontology.json."),
+    out_dir: Path = typer.Argument(...),
+    max_rows: int | None = typer.Option(None, help="Stop after this many conversations."),
+):
+    """Turn the public ABCD dataset into an agent corpus, catalog and schema (a demo workload)."""
+    from ftplatform.agent import abcd
+
+    r = abcd.build(src_dir, out_dir, max_rows=max_rows)
+    typer.secho(f"\n{r['rows']} steps {r['steps']}, {r['tools']} tools, {r['intents']} intents "
+                f"-> {r['out_dir']}\n", fg=typer.colors.GREEN)
+
+
+@agent_tools_app.command("install")
+def agent_tools_install(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    tools_json: Path = typer.Argument(..., exists=True),
+):
+    """Install (or replace) this customer's tool catalog."""
+    import json as json_mod
+
+    from ftplatform.agent import tools as tools_mod
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+        try:
+            catalog = tools_mod.save(ctx, json_mod.loads(tools_json.read_text(encoding="utf-8")))
+        except tools_mod.CatalogError as e:
+            typer.secho(str(e), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from e
+        audit.record(conn, "agent.tools.install", customer_id,
+                     {"tools": len(catalog["tools"]), "mode": catalog["mode"]})
+    finally:
+        conn.close()
+    typer.secho(f"{customer_id}: {len(catalog['tools'])} tools installed, mode={catalog['mode']}",
+                fg=typer.colors.GREEN)
+
+
+@agent_tools_app.command("show")
+def agent_tools_show(customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'.")):
+    """The catalog: every tool, its permission and handler."""
+    from ftplatform.agent import tools as tools_mod
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+    finally:
+        conn.close()
+    catalog = tools_mod.load(ctx)
+    typer.echo(f"\n{customer_id}: mode={catalog['mode']}\n")
+    for t in catalog["tools"]:
+        typer.echo(f"  {t['name']:<24} {t['permission']:<10} {t['handler']['type']:<17} {t['args']}")
+    typer.echo("")
+
+
+@agent_tools_app.command("set")
+def agent_tools_set(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    tool_name: str | None = typer.Argument(None, help="Tool to change (omit with --mode)."),
+    permission: str | None = typer.Option(None, help="auto | approval | forbidden"),
+    mode: str | None = typer.Option(None, help="dry_run | live -- for the whole catalog."),
+):
+    """Change one tool's permission, or switch the catalog between dry_run and live."""
+    from ftplatform.agent import tools as tools_mod
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+        catalog = tools_mod.load(ctx)
+        if mode is not None:
+            catalog["mode"] = mode
+        if permission is not None:
+            t = tools_mod.tool(catalog, tool_name or "")
+            if t is None:
+                typer.secho(f"no tool {tool_name!r}", fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1)
+            t["permission"] = permission
+        try:
+            catalog = tools_mod.save(ctx, catalog)
+        except tools_mod.CatalogError as e:
+            typer.secho(str(e), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from e
+        audit.record(conn, "agent.tools.set", customer_id,
+                     {"tool": tool_name, "permission": permission, "mode": mode})
+    finally:
+        conn.close()
+    typer.secho(f"{customer_id}: saved (mode={catalog['mode']})", fg=typer.colors.GREEN)
+
+
+@agent_kb_app.command("add")
+def agent_knowledge_add(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    paths: list[Path] = typer.Argument(..., exists=True, help=".md, .txt or .json documents."),
+):
+    """Add documents the agent's knowledge_search tool can look things up in."""
+    from ftplatform.agent import knowledge
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+        try:
+            added = knowledge.add(ctx, paths)
+        except ValueError as e:
+            typer.secho(str(e), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from e
+        audit.record(conn, "agent.knowledge.add", customer_id, {"documents": len(added)})
+    finally:
+        conn.close()
+    typer.secho(f"{customer_id}: added {', '.join(added)}", fg=typer.colors.GREEN)
+
+
+@agent_kb_app.command("search")
+def agent_knowledge_search(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    query: str = typer.Argument(...),
+    k: int = typer.Option(3),
+):
+    """What knowledge_search would return for a query."""
+    from ftplatform.agent import knowledge
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+    finally:
+        conn.close()
+    hits = knowledge.search(ctx, query, k=k)
+    if not hits:
+        typer.echo("no match")
+    for h in hits:
+        typer.echo(f"\n[{h['source']}  score {h['score']}]\n{h['text'][:500]}")
+
+
+@agent_app.command("chat")
+def agent_chat(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    model_url: str = typer.Option("http://localhost:8000", help="The customer's model server."),
+    api_key: str | None = typer.Option(None, envvar="FTPLATFORM_API_KEY"),
+):
+    """Talk to the agent in the terminal, as a customer would. Ctrl-C to stop."""
+    from ftplatform.agent import session as session_mod
+    from ftplatform.agent import tools as tools_mod
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+        catalog = tools_mod.load(ctx)
+        model_fn = session_mod.http_model(model_url, api_key)
+        s = session_mod.new_session(ctx)
+        typer.echo(f"\nsession {s['id']} · mode={catalog['mode']} · Ctrl-C to stop\n")
+        while True:
+            try:
+                text = typer.prompt("you")
+            except (KeyboardInterrupt, EOFError, typer.Abort):
+                break
+            out = session_mod.respond(conn, ctx, s, text, model_fn, catalog)
+            for a in out["actions"]:
+                typer.secho(f"  [{a['status']}] {a['tool']}({', '.join(a['args'])}) -> {a['result']}",
+                            fg=typer.colors.YELLOW)
+            for r in out["replies"]:
+                typer.secho(f"agent: {r}", fg=typer.colors.CYAN)
+            if out["stopped"] not in ("wait", "max_steps"):
+                typer.secho(f"  (stopped: {out['stopped']})", fg=typer.colors.RED)
+    finally:
+        conn.close()
+
+
+@agent_app.command("serve")
+def agent_serve(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    model_url: str = typer.Option("http://localhost:8000", help="The customer's model server."),
+    model_api_key: str | None = typer.Option(None, envvar="FTPLATFORM_MODEL_API_KEY"),
+    host: str = typer.Option("0.0.0.0"),
+    port: int = typer.Option(8100),
+    require_auth: bool = typer.Option(True, "--require-auth/--no-require-auth"),
+):
+    """The agent's HTTP API (sessions, messages, approvals) in front of the model server."""
+    import uvicorn
+
+    from ftplatform.agent import server
+    from ftplatform.agent import session as session_mod
+    from ftplatform.agent import tools as tools_mod
+    from ftplatform.auth import keys as keys_mod
+
+    conn = connect(shared=True)            # held while serving, used per request
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+        tools_mod.load(ctx)                                  # fail now, not on the first message
+        resolver = None
+        if require_auth:
+            if not keys_mod.list_keys(conn, customer_id):
+                typer.secho(f"{customer_id!r} has no API key yet -- `ftplatform api-key create "
+                            f"{customer_id}`, or --no-require-auth for local dev.",
+                            fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1)
+            resolver = keys_mod.build_resolver(conn, customer_ids={customer_id})
+        app_ = server.create_app(conn, ctx, session_mod.http_model(model_url, model_api_key),
+                                 api_key_resolver=resolver)
+        uvicorn.run(app_, host=host, port=port)
+    finally:
+        conn.close()
+
+
+@agent_app.command("actions")
+def agent_actions(
+    customer_id: str = typer.Argument(..., help="Customer id, e.g. 'acme'."),
+    status: str | None = typer.Option(None, help="e.g. pending_approval, executed, dry_run"),
+    limit: int = typer.Option(30),
+):
+    """What the agent did, or asked to do."""
+    from ftplatform.agent import executor
+
+    conn = connect()
+    try:
+        _ctx_or_exit(conn, customer_id)
+        rows = executor.list_actions(conn, customer_id, status=status, limit=limit)
+    finally:
+        conn.close()
+    if not rows:
+        typer.echo("no actions")
+    for a in rows:
+        typer.echo(f"  {a['id']}  {a['created_at']}  {a['status']:<17} "
+                   f"{a['tool']}({', '.join(a['args'])})")
+
+
+def _agent_decide(customer_id: str, action_id: str, approve: bool) -> None:
+    from ftplatform.agent import executor
+    from ftplatform.agent import session as session_mod
+    from ftplatform.agent import tools as tools_mod
+
+    conn = connect()
+    try:
+        ctx = _ctx_or_exit(conn, customer_id)
+        try:
+            row = executor.decide(conn, ctx, tools_mod.load(ctx), action_id, approve)
+        except executor.NotPendingError as e:
+            typer.secho(str(e), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from e
+        session_mod.apply_decision(ctx, row)
+    finally:
+        conn.close()
+    typer.secho(f"{action_id}: {row['status']} -> {row['result']}", fg=typer.colors.GREEN)
+
+
+@agent_app.command("approve")
+def agent_approve(customer_id: str = typer.Argument(...), action_id: str = typer.Argument(...)):
+    """Approve a pending action; it runs now (or is recorded, in dry_run)."""
+    _agent_decide(customer_id, action_id, True)
+
+
+@agent_app.command("reject")
+def agent_reject(customer_id: str = typer.Argument(...), action_id: str = typer.Argument(...)):
+    """Reject a pending action."""
+    _agent_decide(customer_id, action_id, False)
 
 
 if __name__ == "__main__":

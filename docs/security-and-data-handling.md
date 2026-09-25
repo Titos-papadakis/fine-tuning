@@ -77,6 +77,31 @@ dedicated compute instead. This must be agreed before onboarding.
 - **Retention.** Captured traffic older than the customer's window (default
   90 days) is deleted by the daily retention job. Rows whose age cannot be
   established are deleted as well.
+- **Agent conversations.** When the model runs as an agent (it replies to
+  your customers and calls your tools), each conversation is stored under
+  your own directory *unredacted*, because the model needs the real names
+  and order ids to act on them. These conversations fall under the same
+  retention window, counted from their last message.
+
+### What the agent is allowed to do
+
+- **Your tools only.** The model can call only the tools in your catalog.
+  Its output is checked against that catalog before anything runs.
+- **A permission on every tool.** Each tool is set to *auto*, *approval*
+  (a member of your staff approves or rejects every call) or *forbidden*.
+  A tool with no explicit setting defaults to *approval*.
+- **Dry run first.** A new agent starts in dry-run mode. Every call it
+  decides on is recorded but never sent to your systems. It sends calls
+  only after you switch it to live. Searching your own documents is
+  read-only and runs even in dry-run mode.
+- **Bounded.** One customer message leads to at most eight model steps.
+  The agent stops if it repeats the call it just made, and it replies with a
+  safe hand-off message if it produces an invalid or self-contradictory
+  step.
+- **Recorded.** Every call is kept with its arguments, result, status and,
+  for approvals, who decided. This record is available to you and is
+  removed along with your other data. The audit log records the tool name
+  and status only, never the arguments.
 
 ## 6. Access control and audit
 

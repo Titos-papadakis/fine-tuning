@@ -14,6 +14,7 @@ unmodified. Nothing about their domain has to be contributed upstream.
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
 from ftspec.core.contract import Contract
@@ -46,6 +47,20 @@ GENERIC_INSTRUCTION = (
 )
 
 
+# Optional top-level key of a custom schema file carrying what a bare schema
+# cannot say: {"headline_field": "tool", "free_text_fields": ["reply"],
+# "short_prompt": "..."}. Stripped before the schema reaches prompts,
+# validation or constrained decoding, so the file stays one self-describing
+# artefact that works the same from `ftspec` and `ftplatform`.
+SCHEMA_SETTINGS_KEY = "x-ftspec"
+
+
+def read_custom_schema(path: Path) -> tuple[Contract, dict]:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    settings = raw.pop(SCHEMA_SETTINGS_KEY, None) or {}
+    return Contract.from_json_schema(raw, name=Path(path).stem), settings
+
+
 class CustomProfile(Profile):
     """A customer's own JSON Schema, with the engine supplying everything else.
 
@@ -57,8 +72,9 @@ class CustomProfile(Profile):
 
     def __init__(self, contract: Contract, name: str = "custom",
                   headline_field: str | None = None,
-                  free_text_fields: tuple = ()):
+                  free_text_fields: tuple = (), short_prompt: str | None = None):
         self.name = name
+        self._short_prompt = short_prompt or "Extract the record as JSON."
         self.title = f"Custom contract ({contract.name})"
         self.description = "Customer-supplied JSON Schema."
         self.compliance = Compliance(
@@ -79,7 +95,7 @@ class CustomProfile(Profile):
     def prompts(self) -> PromptSet:
         schema_prompt = f"{GENERIC_INSTRUCTION}\n\nJSON Schema:\n{self._contract.schema_text()}"
         return PromptSet(
-            short="Extract the record as JSON.",
+            short=self._short_prompt,
             schema=schema_prompt,
             # With no declared business policy the rubric variant equals the
             # schema variant; the benchmark will show zero prompt-tax difference
@@ -128,10 +144,12 @@ def load_profile(name: str, schema_path: Path | None = None,
     if key == "custom":
         if schema_path is None:
             raise ValueError("--profile custom requires --schema pointing at a JSON Schema file")
-        contract = Contract.from_file(Path(schema_path))
+        contract, settings = read_custom_schema(Path(schema_path))
         log.info("custom contract loaded from %s (%d required fields)",
                   schema_path, len(contract.required_fields()))
-        return CustomProfile(contract, headline_field=headline_field)
+        return CustomProfile(contract, headline_field=headline_field or settings.get("headline_field"),
+                             free_text_fields=tuple(settings.get("free_text_fields", ())),
+                             short_prompt=settings.get("short_prompt"))
 
     if schema_path is not None:
         raise ValueError(f"--schema is only valid with --profile custom, not '{name}'")

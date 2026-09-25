@@ -62,6 +62,34 @@ then `pipeline start` / `pipeline drive` exactly as above. A custom
 workload trains only on imported data, and HIPAA/PCI-DSS regimes block
 hosted-API labeling and text capture automatically.
 
+**A customer who wants an agent** (a model that chats *and* acts) is set up
+as a custom workload whose schema is generated from their tool catalog:
+
+```
+ftplatform agent schema acme_tools.json -o acme_step.json [--intents a,b,c]
+ftplatform customer add acme --name "Acme" --workload custom --schema acme_step.json
+ftplatform agent tools install acme acme_tools.json      # starts in dry_run
+ftplatform agent knowledge add acme faq.md returns_policy.md
+ftplatform customer import acme conversations.jsonl      # one row per decision, with conversation_id
+```
+
+Train and deploy it with `pipeline start` / `pipeline drive` as above. Then
+put the agent API in front of the model server:
+
+```
+ftplatform serve acme --port 8000
+ftplatform agent serve acme --model-url http://localhost:8000 --port 8100
+ftplatform agent chat acme                  # try it as a customer, in the terminal
+ftplatform agent actions acme --status pending_approval
+ftplatform agent approve acme <action-id>
+ftplatform agent tools set acme --mode live # only once they have watched dry_run
+```
+
+Each training row is one step: the conversation so far, and what the agent
+did next. `ftplatform agent build-abcd` builds exactly that from the public
+ABCD dataset. It is the demo workload, and `notebooks/kaggle_agent_runner/`
+trains and benchmarks it on Kaggle.
+
 **Data handling, once per customer and then daily:**
 
 ```

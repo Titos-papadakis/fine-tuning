@@ -142,6 +142,22 @@ CREATE TABLE IF NOT EXISTS kaggle_artifacts (
 
 -- Append-only; see ftplatform/audit.py. No FK on customer_id on purpose: the
 -- record of a customer's deletion must outlive the customer row.
+-- Every tool call a customer's agent made or asked to make: arguments
+-- included, because this is the customer's own record of what their agent
+-- did (the audit_log copy carries only ids and status).
+CREATE TABLE IF NOT EXISTS agent_actions (
+    id            TEXT PRIMARY KEY,
+    customer_id   TEXT NOT NULL REFERENCES customers(id),
+    session_id    TEXT NOT NULL,
+    tool          TEXT NOT NULL,
+    args_json     TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    result        TEXT,
+    created_at    TEXT NOT NULL,
+    decided_at    TEXT,
+    decided_by    TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_actions_by_customer ON agent_actions (customer_id, status);
 CREATE TABLE IF NOT EXISTS audit_log (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     at            TEXT NOT NULL,
@@ -170,9 +186,16 @@ CREATE TABLE IF NOT EXISTS billing_accounts (
 """
 
 
-def connect(db_path: Path | None = None) -> sqlite3.Connection:
-    """Open the platform database, creating its schema if needed."""
-    conn = sqlite3.connect(db_path or DB_PATH)
+def connect(db_path: Path | None = None, shared: bool = False) -> sqlite3.Connection:
+    """Open the platform database, creating its schema if needed.
+
+    shared=True is for a server: one connection held for its lifetime and
+    used from whichever thread handles a request. Safe because Python's
+    sqlite3 is built serialized (sqlite3.threadsafety == 3) -- sqlite itself
+    locks each call -- which the default same-thread check does not know."""
+    if shared and sqlite3.threadsafety != 3:
+        raise RuntimeError("this sqlite3 build is not serialized; a shared connection is unsafe")
+    conn = sqlite3.connect(db_path or DB_PATH, check_same_thread=not shared)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     conn.row_factory = sqlite3.Row

@@ -5,7 +5,8 @@ kept. Stored in the customer's own tree (customers/<id>/policy.json) so it
 is as isolated as their data and travels with it.
 
 Scope, stated plainly: this governs *captured production traffic* (the
-production log and the review queue built from it). A customer's imported
+production log and the review queue built from it) and the agent's stored
+conversations. A customer's imported
 training corpus and the corrections folded into training are their
 training data -- kept until they are deleted with the customer, and
 described that way in docs/security-and-data-handling.md.
@@ -81,4 +82,19 @@ def enforce_retention(ctx, now: datetime | None = None) -> dict:
             tmp = path.with_suffix(".tmp")
             tmp.write_text("".join(ln + "\n" for ln in keep), encoding="utf-8")
             tmp.replace(path)
+    # Agent conversations (customers/<id>/agent/sessions) are kept verbatim --
+    # the model needs the real names and order ids to act -- so they fall
+    # under the same retention window, by last activity.
+    sessions = ctx.customer_root() / "agent" / "sessions"
+    if sessions.exists():
+        n = 0
+        for f in sessions.glob("*.json"):
+            try:
+                ts = _parse(json.loads(f.read_text(encoding="utf-8")).get("updated_at"))
+            except (OSError, ValueError):
+                ts = None
+            if ts is None or ts < cutoff:
+                f.unlink()
+                n += 1
+        removed["agent_sessions"] = n
     return removed
