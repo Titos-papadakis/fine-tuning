@@ -90,10 +90,14 @@ run(["ftspec", "prepare", *PROFILE_ARGS, "--from-jsonl", str(ABCD_OUT / "corpus.
      "--n-val", str(N_VAL), "--n-eval", str(N_EVAL)], cwd=CLONE_DIR)
 run(["ftspec", "audit", *PROFILE_ARGS], cwd=CLONE_DIR, check=False)
 run(["ftspec", "validate", *PROFILE_ARGS], cwd=CLONE_DIR)
-train_files = list((CLONE_DIR / "data").rglob("train.jsonl"))
-n_train = sum(1 for _ in open(train_files[0], encoding="utf-8"))
+# data/custom/, exactly: the repo also ships data/<vertical>/train.jsonl for
+# the built-in profiles, and counting one of those would size training wrong.
+DATA_DIR = CLONE_DIR / "data" / OUT_KEY
+n_train = sum(1 for _ in open(DATA_DIR / "train.jsonl", encoding="utf-8"))
+if n_train < 5000:
+    raise SystemExit(f"only {n_train} train rows in {DATA_DIR} -- expected ~8,100")
 max_steps = -(-n_train // EFFECTIVE_BATCH_SIZE) * N_EPOCHS
-print(f"train rows {n_train} ({train_files[0]}) -> max_steps {max_steps}")
+print(f"train rows {n_train} ({DATA_DIR}) -> max_steps {max_steps}")
 
 step("4 . Train")
 started = time.time()
@@ -127,10 +131,8 @@ for name in ("reports", "manifests", "lora_adapter"):
         shutil.copytree(src, out / name, dirs_exist_ok=True)
 if CACHE_DIR.exists():
     shutil.copytree(CACHE_DIR, out / "eval_cache", dirs_exist_ok=True)
-data_dir = train_files[0].parent
-for name in ("eval.jsonl",):
-    if (data_dir / name).exists():
-        shutil.copy(data_dir / name, out / name)
+if (DATA_DIR / "eval.jsonl").exists():
+    shutil.copy(DATA_DIR / "eval.jsonl", out / "eval.jsonl")
 for name in ("tools.json", "schema.json"):
     shutil.copy(ABCD_OUT / name, out / name)
 
